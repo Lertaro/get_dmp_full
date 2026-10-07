@@ -17,8 +17,23 @@ fn main() {
 }
 
 fn run(argument: Option<&OsStr>) -> io::Result<()> {
-    let output_dir = std::env::current_exe()?.with_file_name("dump_file");
-    fs::create_dir_all(&output_dir)?;
+    let root = std::env::current_exe()?.with_file_name("dump_file");
+    fs::create_dir_all(&root)?;
+    let output_dir = if argument.is_none() {
+        // Keep previous runs untouched and exclude their contents from this run's ZIP.
+        let session = format!(
+            "{}-{}",
+            error_log::local_timestamp()
+                .replace([':', '.'], "-")
+                .replace(' ', "_"),
+            std::process::id(),
+        );
+        let directory = root.join(session);
+        fs::create_dir(&directory)?;
+        directory
+    } else {
+        root
+    };
     let log = ErrorLog::new(&output_dir)?;
 
     if let Some(argument) = argument {
@@ -39,9 +54,18 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
         return Ok(());
     }
 
-    // Collection steps are independent; an error must not prevent the remaining work.
-    let _ = log.report("DUMP", "collect", dump::collect(&output_dir, &log));
-    logs::collect(&output_dir, &log);
+    // An unsuccessful query is not evidence that all target processes have stopped.
+    if let Some(processes) = log.report("PROCESSES", "query", processes::running()) {
+        if processes.is_empty() {
+            diagnostics::collect(&output_dir, &log);
+        } else {
+            let _ = log.report(
+                "DUMP",
+                "collect",
+                dump::collect(&output_dir, &processes, &log),
+            );
+        }
+    }
     let _ = log.report("ZIP", "archive", archive::create(&output_dir));
     Ok(())
 }
@@ -115,7 +139,7 @@ mod error_log {
         format!("[{}][ERROR][{module}]: {context}", local_timestamp())
     }
 
-    fn local_timestamp() -> String {
+    pub(super) fn local_timestamp() -> String {
         #[repr(C)]
         #[derive(Default)]
         struct SystemTime {
@@ -328,7 +352,7 @@ mod processes {
     use super::command;
     use std::{fmt, io, process::Command};
 
-    const TARGET_NAMES: [&str; 2] = ["lertaro.app.exe", "lertaro.service.exe"];
+    pub(super) const TARGET_NAMES: [&str; 2] = ["lertaro.app.exe", "lertaro.service.exe"];
 
     pub(super) struct Process {
         pub name: &'static str,
@@ -374,14 +398,13 @@ mod dump {
         process::{Command, Output},
     };
 
-    pub(super) fn collect(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
-        let processes = processes::running()?;
-        if processes.is_empty() {
-            return Ok(());
-        }
-
+    pub(super) fn collect(
+        output_dir: &Path,
+        processes: &[processes::Process],
+        log: &ErrorLog,
+    ) -> io::Result<()> {
         let executable = tools::procdump(output_dir)?;
-        for process in &processes {
+        for process in processes {
             let _ = log.report("DUMP", process, create(&executable, output_dir, process));
         }
         Ok(())
@@ -466,6 +489,237 @@ mod logs {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(source, destination)?;
+        }
+        Ok(())
+    }
+}
+
+mod diagnostics {
+    use super::{ErrorLog, command, logs, processes};
+    use std::{ffi::OsStr, fs, io, path::Path, process::Command};
+
+    // wevtutil and these event schemas are available on Windows 10.
+    pub(super) const APPLICATION_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and ((Provider[@Name='Application Error'] and EventID=1000) or (Provider[@Name='.NET Runtime'] and EventID=1026) or (Provider[@Name='Windows Error Reporting'] and EventID=1001))]]";
+    pub(super) const SYSTEM_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and Provider[@Name='Service Control Manager'] and (EventID=7000 or EventID=7001 or EventID=7009 or EventID=7011 or EventID=7022 or EventID=7023 or EventID=7024 or EventID=7031 or EventID=7034)]]";
+
+    pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
+        logs::collect(output_dir, log);
+        for (channel, query) in [("Application", APPLICATION_QUERY), ("System", SYSTEM_QUERY)] {
+            let _ = log.report(
+                "EVENTS",
+                channel,
+                collect_events(channel, query, output_dir),
+            );
+        }
+
+        for (variable, label) in [("LOCALAPPDATA", "user"), ("ProgramData", "machine")] {
+            if let Some(base) = std::env::var_os(variable) {
+                for queue in ["ReportArchive", "ReportQueue"] {
+                    let source = Path::new(&base).join("Microsoft/Windows/WER").join(queue);
+                    let destination = output_dir.join("crash/wer").join(label).join(queue);
+                    let _ = log.report(
+                        "WER",
+                        source.display(),
+                        copy_reports(&source, &destination, log),
+                    );
+                }
+            }
+        }
+
+        for (variable, suffix, label) in [
+            ("LOCALAPPDATA", "CrashDumps", "user"),
+            (
+                "SystemRoot",
+                "System32/config/systemprofile/AppData/Local/CrashDumps",
+                "system",
+            ),
+            (
+                "SystemRoot",
+                "ServiceProfiles/LocalService/AppData/Local/CrashDumps",
+                "local-service",
+            ),
+            (
+                "SystemRoot",
+                "ServiceProfiles/NetworkService/AppData/Local/CrashDumps",
+                "network-service",
+            ),
+        ] {
+            if let Some(base) = std::env::var_os(variable) {
+                let source = Path::new(&base).join(suffix);
+                let destination = output_dir.join("crash/dumps").join(label);
+                let _ = log.report(
+                    "CRASHDUMPS",
+                    source.display(),
+                    copy_dumps(&source, &destination, log),
+                );
+            }
+        }
+    }
+
+    fn collect_events(channel: &str, query: &str, output_dir: &Path) -> io::Result<()> {
+        let output = command::output(
+            Command::new("wevtutil.exe")
+                .args([
+                    "qe",
+                    channel,
+                    "/rd:true",
+                    "/f:RenderedXml",
+                    "/e:Events",
+                    "/uni:true",
+                ])
+                .arg(format!("/q:{query}")),
+            command::console_code_page(),
+        )?;
+        let events = filter_events(&command::decode(
+            &output.stdout,
+            command::console_code_page(),
+        ));
+        if !events.is_empty() {
+            let directory = output_dir.join("crash/events");
+            fs::create_dir_all(&directory)?;
+            fs::write(
+                directory.join(format!("{channel}.xml")),
+                format!(
+                    "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Events>\n{events}</Events>\n"
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn filter_events(xml: &str) -> String {
+        let mut selected = String::new();
+        // wevtutil emits complete Event elements; text inside them is XML-escaped.
+        for part in xml.split_inclusive("</Event>") {
+            let Some(start) = part.find("<Event ").or_else(|| part.find("<Event>")) else {
+                continue;
+            };
+            let event = &part[start..];
+            let Some((system, payload)) = event.split_once("</System>") else {
+                continue;
+            };
+            // Match event data, not unrelated computer/account names in System metadata.
+            let payload = payload.split("<RenderingInfo").next().unwrap_or_default();
+            if event.ends_with("</Event>")
+                && system.contains("<Level>2</Level>")
+                && mentions_lertaro(payload)
+            {
+                selected.push_str(event);
+                selected.push('\n');
+            }
+        }
+        selected
+    }
+
+    fn mentions_lertaro(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        lower.match_indices("lertaro").any(|(start, _)| {
+            let word_character = |c: char| c.is_alphanumeric() || c == '_';
+            !lower[..start]
+                .chars()
+                .next_back()
+                .is_some_and(word_character)
+                && !lower[start + "lertaro".len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(word_character)
+        })
+    }
+
+    pub(super) fn report_is_target(report: &str) -> bool {
+        report
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .any(|(key, value)| {
+                let key = key.trim();
+                if !key.eq_ignore_ascii_case("AppName") && !key.eq_ignore_ascii_case("AppPath") {
+                    return false;
+                }
+                Path::new(value.trim().trim_matches('"'))
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| {
+                        processes::TARGET_NAMES
+                            .iter()
+                            .any(|target| target.eq_ignore_ascii_case(name))
+                    })
+            })
+    }
+
+    pub(super) fn copy_reports(
+        source: &Path,
+        destination: &Path,
+        log: &ErrorLog,
+    ) -> io::Result<()> {
+        if !source.try_exists()? {
+            return Ok(());
+        }
+        for entry in fs::read_dir(source)? {
+            let Some(entry) = log.report("WER", source.display(), entry) else {
+                continue;
+            };
+            // Folder names are only a prefilter; Report.wer must identify a target executable.
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("lertaro")
+            {
+                continue;
+            }
+            let path = entry.path();
+            let Some(kind) = log.report("WER", path.display(), entry.file_type()) else {
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let report_path = path.join("Report.wer");
+            let Some(bytes) = log.report("WER", report_path.display(), fs::read(&report_path))
+            else {
+                continue;
+            };
+            if report_is_target(&command::decode(&bytes, 0)) {
+                let _ = log.report(
+                    "WER",
+                    path.display(),
+                    logs::copy_path(&path, &destination.join(entry.file_name()), log),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn is_target_dump(name: &OsStr) -> bool {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name.ends_with(".dmp")
+            && processes::TARGET_NAMES
+                .iter()
+                .any(|target| name.starts_with(&format!("{target}.")))
+    }
+
+    pub(super) fn copy_dumps(source: &Path, destination: &Path, log: &ErrorLog) -> io::Result<()> {
+        if !source.try_exists()? {
+            return Ok(());
+        }
+        for entry in fs::read_dir(source)? {
+            let Some(entry) = log.report("CRASHDUMPS", source.display(), entry) else {
+                continue;
+            };
+            if !is_target_dump(&entry.file_name()) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(kind) = log.report("CRASHDUMPS", path.display(), entry.file_type()) else {
+                continue;
+            };
+            if kind.is_file() {
+                let _ = log.report(
+                    "CRASHDUMPS",
+                    path.display(),
+                    logs::copy_path(&path, &destination.join(entry.file_name()), log),
+                );
+            }
         }
         Ok(())
     }

@@ -1,6 +1,6 @@
 [package]
 name = "get_dump_full"
-version = "0.0.3"
+version = "0.0.5"
 edition = "2024"
 build = "build.rs"
 
