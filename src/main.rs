@@ -2,10 +2,12 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use error_log::ErrorLog;
+
+const UPLOAD_SITE: &str = "https://app.dashbeam.net/";
 
 fn main() {
     let argument = std::env::args_os().nth(1);
@@ -55,6 +57,12 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
         return Ok(());
     }
 
+    // The dump question comes first, while the console is still idle: only a memory
+    // problem needs the heap, and everything else fits in a mini dump of ~3% the size.
+    let processes = status::run("正在检查 Lertaro 进程", processes::running);
+    let memory = matches!(&processes, Ok(list) if !list.is_empty())
+        && prompt::confirm("本次问题是否与内存有关（越用越占内存、内存泄漏、内存暴涨）？");
+
     // Machine, permission and runtime details belong in every bundle, dump or no dump.
     system::collect(&output_dir, &log);
     // Logs and previously written crash artifacts describe the failure just as well while
@@ -62,21 +70,47 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
     diagnostics::collect(&output_dir, &log);
 
     // An unsuccessful query is not evidence that all target processes have stopped.
-    let processes = status::run("正在检查 Lertaro 进程", processes::running);
+    let mut uncompressed = false;
     if let Some(processes) = log.report("PROCESSES", "query", processes)
         && !processes.is_empty()
     {
-        let _ = log.report(
-            "DUMP",
-            "collect",
-            dump::collect(&output_dir, &processes, &log),
-        );
+        uncompressed = log
+            .report(
+                "DUMP",
+                "collect",
+                dump::collect(&output_dir, &processes, &log, memory),
+            )
+            .unwrap_or_default();
     }
-    let archived = status::run("正在压缩诊断文件", || archive::create(&output_dir));
+    // An uncompressed full dump is raw memory, so archiving earns its keep. Mini dumps and
+    // ProDump's own compressed dumps are already small, where deflating only costs time.
+    let level = if uncompressed { "-mx=1" } else { "-mx=0" };
+    let archived = status::run("正在压缩诊断文件", || {
+        archive::create(&output_dir, level)
+    });
     if let Some(zip) = log.report("ZIP", "archive", archived) {
         println!("诊断包已生成：{}", zip.display());
+        offer_transfer(&zip);
     }
     Ok(())
+}
+
+fn offer_transfer(zip: &Path) {
+    println!();
+    if prompt::confirm("是否需要现在打开上传站点，把这个文件交给开发者？") {
+        // rundll32 hands the URL to the default browser without a shell, so it needs no quoting.
+        match command::text(
+            "rundll32.exe",
+            &["url.dll,FileProtocolHandler", UPLOAD_SITE],
+        ) {
+            Ok(_) => println!(
+                "已打开 {UPLOAD_SITE}：把诊断包拖进页面上传，再把页面给出的一次性传输票据发给开发者。\n开发者接收完成之前请不要关闭这个浏览器窗口。该方式不限速、无需登录。\n诊断包位置：{}",
+                zip.display()
+            ),
+            Err(error) => println!("打开浏览器失败（{error}），请手动访问 {UPLOAD_SITE}"),
+        }
+    }
+    println!("请不要使用百度网盘等限速网盘传输诊断包：下载会被限速，开发者往往拿不到完整文件。");
 }
 
 fn pause() {
@@ -88,6 +122,21 @@ fn environment_path(variable: &str) -> io::Result<PathBuf> {
     let value = std::env::var_os(variable)
         .ok_or_else(|| io::Error::other("environment variable is not set"))?;
     Ok(PathBuf::from(value))
+}
+
+mod prompt {
+    use std::io::{self, Write};
+
+    /// Asks a yes/no question on the console. An unattended run gives no answer at all, so
+    /// the default keeps it moving instead of blocking forever.
+    pub(super) fn confirm(question: &str) -> bool {
+        print!("{question}（是/否，默认否）");
+        let _ = io::stdout().flush();
+        let mut answer = String::new();
+        let _ = io::stdin().read_line(&mut answer);
+        println!();
+        matches!(answer.trim(), "是" | "y" | "Y" | "yes" | "Yes" | "YES")
+    }
 }
 
 mod status {
@@ -539,23 +588,26 @@ mod dump {
 
     const COMPRESSED: &str = "-mac";
     const UNCOMPRESSED: &str = "-ma";
+    const MINI: &str = "-mm";
 
+    /// Collects every target process, answering whether an uncompressed full dump landed.
     pub(super) fn collect(
         output_dir: &Path,
         processes: &[processes::Process],
         log: &ErrorLog,
-    ) -> io::Result<()> {
+        memory: bool,
+    ) -> io::Result<bool> {
         let executable = tools::procdump(output_dir)?;
+        let mut uncompressed = false;
         for process in processes {
-            let _ = log.report(
-                "DUMP",
-                process,
-                status::run(&format!("正在转储 {process}"), || {
-                    create(&executable, output_dir, process, log)
-                }),
-            );
+            let landed = status::run(&format!("正在转储 {process}"), || {
+                create(&executable, output_dir, process, log, memory)
+            });
+            if log.report("DUMP", process, landed).unwrap_or_default() {
+                uncompressed = true;
+            }
         }
-        Ok(())
+        Ok(uncompressed)
     }
 
     fn create(
@@ -563,16 +615,22 @@ mod dump {
         output_dir: &Path,
         process: &processes::Process,
         log: &ErrorLog,
-    ) -> io::Result<()> {
+        memory: bool,
+    ) -> io::Result<bool> {
+        // Stacks, metadata and what the stacks reference are enough for crashes, hangs and
+        // startup failures, and that is roughly 3% of a full dump.
+        if !memory {
+            return capture(executable, output_dir, process, MINI).map(|()| false);
+        }
         // Some Windows builds refuse ProDump's compressed full dump outright. Falling back
         // costs a larger file, which is still better than shipping a bundle without a dump.
         match capture(executable, output_dir, process, COMPRESSED) {
             Err(error) if error.to_string().contains("Error writing dump file") => {
                 // Record the refusal so the reader learns this machine cannot compress.
                 log.error("DUMP", process, format!("compressed dump refused: {error}"));
-                capture(executable, output_dir, process, UNCOMPRESSED)
+                capture(executable, output_dir, process, UNCOMPRESSED).map(|()| true)
             }
-            result => result,
+            result => result.map(|()| false),
         }
     }
 
@@ -1328,7 +1386,7 @@ mod archive {
         process::Command,
     };
 
-    pub(super) fn create(output_dir: &Path) -> io::Result<PathBuf> {
+    pub(super) fn create(output_dir: &Path, level: &str) -> io::Result<PathBuf> {
         let executable = tools::zip(output_dir)?;
         let destination = output_dir.with_extension("zip");
         let pending = output_dir.with_extension("pending.zip");
@@ -1341,13 +1399,15 @@ mod archive {
                 .args([
                     "a",
                     "-tzip",
-                    "-mx=0",
+                    level,
                     "-y",
                     "-sccUTF-8",
                     "-bb0",
                     "-bd",
                     "-sse",
                     "-ssw",
+                ])
+                .args([
                     "-xr!procdump*.exe",
                     "-xr!7z.exe",
                     "-xr!7z.dll",
