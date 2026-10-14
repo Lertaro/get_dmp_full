@@ -135,7 +135,10 @@ mod prompt {
         let mut answer = String::new();
         let _ = io::stdin().read_line(&mut answer);
         println!();
-        matches!(answer.trim(), "是" | "y" | "Y" | "yes" | "Yes" | "YES")
+        matches!(
+            answer.trim().to_lowercase().as_str(),
+            "是" | "对" | "y" | "yes" | "1"
+        )
     }
 }
 
