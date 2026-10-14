@@ -31,7 +31,7 @@
 | 9 | `wevtutil.exe` | `qe Application/System /rd:true /f:RenderedXml /e:Events /uni:true /q:<XPath>` | 最近 24 小时、正文提到 Lertaro 的错误事件 → `crash\events\*.xml` |
 | 10 | 自身文件复制 | — | WER 报告与四个 `CrashDumps` 目录里已有的 Lertaro 转储 → `crash\wer\`、`crash\dumps\` |
 | 11 | `tasklist.exe` | `/FO CSV /NH` | 判断 `lertaro.app.exe`、`lertaro.service.exe` 是否在运行 |
-| 12 | `.dump_tools\procdump.exe` | `-accepteula -ma -o <PID> PROCESSNAME_PID.dmp` | **仅当目标进程在运行**：抓完整内存转储，`PROCESSNAME`、`PID` 由 Procdump 替换成 `<进程名>_<进程ID>` |
+| 12 | `.dump_tools\procdump.exe` | `-accepteula -mac -o <PID> PROCESSNAME_PID.dmp`，被系统拒绝时自动改用 `-ma` | **仅当目标进程在运行**：抓完整内存转储，`PROCESSNAME`、`PID` 由 Procdump 替换成 `<进程名>_<进程ID>`。`-mac` 是带内存压缩的完整转储（内容等同 `-ma`，体积可小 80%），但部分 Windows 版本会直接拒绝写入（实测 `0x80070057 参数错误`），此时程序退回 `-ma` 并在 `run.log` 记一行 `compressed dump refused` |
 | 13 | `.dump_tools\7z.exe` | `a -tzip -mx=0 ...` | 打包 ZIP（`-mx=0` 为不压缩，避免大 dump 反复压缩耗时） |
 
 第 1–10 与第 13 步每次运行都做，只有第 12 步取决于进程是否在运行；也就是说不管 Lertaro 有没有在跑，日志和系统里已有的崩溃转储都会一并收走。
@@ -107,7 +107,7 @@
 - Windows 事件查看器 Application / System 通道最近 24 小时的错误事件，且事件正文中提到 Lertaro 的才写入 `crash\events\`
 - Windows 错误报告（WER）`ReportArchive`、`ReportQueue` 中报告对象为 Lertaro 程序的文件夹 → `crash\wer\<user|machine>\`（内含计算机名、用户名、模块路径等）
 - 用户、系统账户（`%SystemRoot%\System32\config\systemprofile`）、LocalService、NetworkService 四个 `AppData\Local\CrashDumps` 目录中，文件名以 `lertaro.app.exe.` 或 `lertaro.service.exe.` 开头且以 `.dmp` 结尾的文件 → `crash\dumps\<user|system|local-service|network-service>\`
-- 目标进程在运行时的**完整内存转储**（`-ma`）。内存转储是进程当时内存的原样快照，可能包含剪贴板内容、正在编辑的文本、已登录令牌等敏感数据，请务必确认接收方可信后再分享。
+- 目标进程在运行时的**完整内存转储**（`-mac`，系统拒绝压缩时自动退回 `-ma`）。内存转储是进程当时内存的原样快照，可能包含剪贴板内容、正在编辑的文本、已登录令牌等敏感数据，请务必确认接收方可信后再分享。
 
 ### 7. 其他
 

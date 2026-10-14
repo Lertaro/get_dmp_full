@@ -537,6 +537,9 @@ mod dump {
         process::{Command, Output},
     };
 
+    const COMPRESSED: &str = "-mac";
+    const UNCOMPRESSED: &str = "-ma";
+
     pub(super) fn collect(
         output_dir: &Path,
         processes: &[processes::Process],
@@ -548,7 +551,7 @@ mod dump {
                 "DUMP",
                 process,
                 status::run(&format!("正在转储 {process}"), || {
-                    create(&executable, output_dir, process)
+                    create(&executable, output_dir, process, log)
                 }),
             );
         }
@@ -559,11 +562,30 @@ mod dump {
         executable: &Path,
         output_dir: &Path,
         process: &processes::Process,
+        log: &ErrorLog,
+    ) -> io::Result<()> {
+        // Some Windows builds refuse ProDump's compressed full dump outright. Falling back
+        // costs a larger file, which is still better than shipping a bundle without a dump.
+        match capture(executable, output_dir, process, COMPRESSED) {
+            Err(error) if error.to_string().contains("Error writing dump file") => {
+                // Record the refusal so the reader learns this machine cannot compress.
+                log.error("DUMP", process, format!("compressed dump refused: {error}"));
+                capture(executable, output_dir, process, UNCOMPRESSED)
+            }
+            result => result,
+        }
+    }
+
+    fn capture(
+        executable: &Path,
+        output_dir: &Path,
+        process: &processes::Process,
+        dump_type: &str,
     ) -> io::Result<()> {
         let output = Command::new(executable)
             .args([
                 "-accepteula",
-                "-ma",
+                dump_type,
                 "-o",
                 &process.pid.to_string(),
                 "PROCESSNAME_PID.dmp",
