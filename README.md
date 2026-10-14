@@ -24,13 +24,16 @@
 | 2 | `reg.exe` | `query <Uninstall 根> /s`（HKLM 64 位、HKLM WOW6432Node、HKCU 三处） | 由 `DisplayName` 含 Lertaro 的卸载项读 `InstallLocation`/`Inno Setup: App Path`，定位安装目录 |
 | 3 | `sc.exe` | `qc LertaroService` | 读 `BINARY_PATH_NAME`，得到后台服务真正运行的安装目录 |
 | 4 | `icacls.exe` | 逐个目录名 | 采集安装目录与配置目录的 NTFS 权限 → `system\icacls.txt` |
-| 5 | `tasklist.exe` | `/FO CSV /NH` | 判断 `lertaro.app.exe`、`lertaro.service.exe` 是否在运行，决定走哪条采集分支 |
-| 6a | `.dump_tools\procdump.exe` | `-accepteula -ma -o <PID> PROCESSNAME_PID.dmp` | **进程仍在运行时**：抓取完整内存转储 |
-| 6b | `wevtutil.exe` | `qe Application/System /rd:true /f:RenderedXml /e:Events /uni:true /q:<XPath>` | **进程未运行时**：取最近 24 小时、文本中提到 Lertaro 的错误事件 → `crash\events\*.xml` |
-| 7 | 自身文件复制 | — | 日志、WER 崩溃报告、系统 CrashDumps 目录中的 Lertaro dump |
-| 8 | `.dump_tools\7z.exe` | `a -tzip -mx=0 ...` | 打包 ZIP（`-mx=0` 为不压缩，避免大 dump 反复压缩耗时） |
+| 5 | `whoami.exe` | `/user`、`/groups`、`/priv` | 采集账户、令牌组与完整性级别、权限列表 |
+| 6 | `reg.exe` | `query HKLM\...\CurrentVersion\Policies\System` | 读 UAC 策略值（`EnableLUA` 等），判断账户能否请求管理员 → `system\account.txt` |
+| 7 | `reg.exe` + 目录扫描 | `query HKLM\...\NET Framework Setup\NDP\v4\Full`、`v4\Client`；列 `%ProgramFiles%\dotnet` 与 `%ProgramFiles(x86)%\dotnet` 下的版本目录 | 采集 .NET Framework 与 .NET 7/8/9/10 安装情况 → `system\dotnet.txt` |
+| 8 | `tasklist.exe` | `/FO CSV /NH` | 判断 `lertaro.app.exe`、`lertaro.service.exe` 是否在运行，决定走哪条采集分支 |
+| 9a | `.dump_tools\procdump.exe` | `-accepteula -ma -o <PID> PROCESSNAME_PID.dmp` | **进程仍在运行时**：抓取完整内存转储，文件名里的 `PROCESSNAME`、`PID` 由 Procdump 替换为 `<进程名>_<进程ID>.dmp` |
+| 9b | `wevtutil.exe` | `qe Application/System /rd:true /f:RenderedXml /e:Events /uni:true /q:<XPath>` | **进程未运行时**：取最近 24 小时、文本中提到 Lertaro 的错误事件 → `crash\events\*.xml` |
+| 10 | 自身文件复制 | — | 日志、WER 崩溃报告、系统 CrashDumps 目录中的 Lertaro dump |
+| 11 | `.dump_tools\7z.exe` | `a -tzip -mx=0 ...` | 打包 ZIP（`-mx=0` 为不压缩，避免大 dump 反复压缩耗时） |
 
-第 1–4 步在两种分支下都会执行。
+第 1–7 步在两种分支下都会执行。
 
 内嵌的 fastfetch / procdump / 7-Zip 在运行时解压到 `dump_file\.dump_tools\`（与采集目录同级，不会被写进 ZIP），运行结束后**不会自动删除**，可自行清理。
 
@@ -52,26 +55,42 @@
 
 目录不存在时只写一行“目录不存在”，不中断。
 
-### 3. 日志文件（只读复制，不移动、不删除、不修改源文件）
+### 3. 账户与权限（`system\account.txt`）
+
+- `whoami /user`：当前账户名与其 SID
+- `whoami /groups`：进程令牌中的组、属性与完整性级别（`Mandatory Label`）。**注意**：用 Microsoft 账户登录时，列表里会有形如 `MicrosoftAccount\你的邮箱` 的声明，邮箱地址因此出现在报告中
+- `whoami /priv`：当前进程的权限（Privilege）列表，例如 `SeDebugPrivilege` 决定 Procdump 能否打开其他进程
+- UAC 策略（注册表 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`，只读）：`EnableLUA`、`ConsentPromptBehaviorAdmin`、`ConsentPromptBehaviorUser`、`PromptOnSecureDesktop`、`FilterAdministratorToken`、`LocalAccountTokenFilterPolicy`；值不存在记为 `(absent)`
+- `[summary]`：由令牌推导的三行结论——`local administrator`（账户是否属于本地管理员组，即能否请求提权）、`integrity`（Low/Medium/High/System 及对应 SID）、`already elevated`（当前进程是否已提权）
+
+判定依据是本地管理员组的固定 SID `S-1-5-32-544` 是否出现在令牌中，不依赖语言版本；本程序正常以管理员身份运行，所以通常是 `High` + `already elevated: yes`。
+
+### 4. .NET 运行环境（`system\dotnet.txt`）
+
+- .NET Framework：读 `HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full` 与 `v4\Client` 的 `Install`/`Release`/`Version`，按微软公布的 Release 阈值推断已装版本，并逐项给出 `4`、`4.5`、`4.8` 是否存在（阈值推断只说明“至少是这个版本”）
+- .NET 7/8/9/10：扫描 `%ProgramFiles%\dotnet`（x64）与 `%ProgramFiles(x86)%\dotnet`（x86）下 `shared\Microsoft.NETCore.App`（运行时）、`shared\Microsoft.WindowsDesktop.App`（WPF 依赖的桌面运行时）、`sdk` 三类版本目录，列出实际版本号并按主版本给出 `7`/`8`/`9`/`10` 清单
+- 这一项只记录注册表值与目录名，不读取这些安装目录内的任何文件内容
+
+### 5. 日志文件（只读复制，不移动、不删除、不修改源文件）
 
 - `%LOCALAPPDATA%\Lertaro\logs\**` → `logs\user\`（递归复制全部用户日志；日志内容可能包含访问过的文件名与路径、搜索关键字等）
 - `%ProgramData%\Lertaro\logs\service.log` → `logs\service\`
 
-### 4. 崩溃相关
+### 6. 崩溃相关
 
 - Windows 事件查看器 Application / System 通道最近 24 小时的错误事件，且事件正文中提到 Lertaro 的才写入 `crash\events\`
 - Windows 错误报告（WER）`ReportArchive`、`ReportQueue` 中报告对象为 Lertaro 程序的文件夹 → `crash\wer\<user|machine>\`（内含计算机名、用户名、模块路径等）
 - 用户、系统账户（`%SystemRoot%\System32\config\systemprofile`）、LocalService、NetworkService 四个 `AppData\Local\CrashDumps` 目录中，文件名以 `lertaro.app.exe.` 或 `lertaro.service.exe.` 开头且以 `.dmp` 结尾的文件 → `crash\dumps\<user|system|local-service|network-service>\`
 - 目标进程在运行时的**完整内存转储**（`-ma`）。内存转储是进程当时内存的原样快照，可能包含剪贴板内容、正在编辑的文本、已登录令牌等敏感数据，请务必确认接收方可信后再分享。
 
-### 5. 其他
+### 7. 其他
 
 `run.log` 记录本次运行中失败的步骤；进程列表本身只用于判断分支，不会整份写入 ZIP。
 
 ## 不做什么
 
 - 不读取浏览器数据、凭据管理器与其他应用程序的文件
-- 注册表只查询、不写入：为了定位安装目录会枚举卸载项列表，但结果里只保留 Lertaro 相关的路径
+- 注册表只查询、不写入：枚举卸载项列表以定位安装目录（结果里只保留 Lertaro 相关的路径），另外只读固定的 UAC 策略键与 .NET Framework 安装键
 - 不联网，不做任何自动上报
 - 不修改、移动或删除任何被采集的文件；写入的只有 `dump_file\` 与 `dump_file\.dump_tools\`
 - 不安装服务、不改注册表（只查询）、不改任何目录的权限（`icacls` 仅读取）
@@ -87,15 +106,15 @@
    │  ├─ run.log              失败步骤记录
    │  ├─ system\fastfetch.txt
    │  ├─ system\icacls.txt
+   │  ├─ system\account.txt
+   │  ├─ system\dotnet.txt
    │  ├─ logs\user\...        logs\service\service.log
    │  ├─ crash\events\*.xml   crash\wer\... crash\dumps\...
-   │  └─ PROCESSNAME_PID.dmp  仅进程在运行时产生
+   │  └─ Lertaro.App.exe_<PID>.dmp  仅进程在运行时产生，每个目标进程一份
    └─ 2026-10-14_19-55-47-876-31392.zip
 ```
 
 每次无参数运行都会新建以“时间戳-进程ID”命名的会话目录，旧会话不会被覆盖，也不会被后一次的 ZIP 收录。
-
-已知限制：ProcDump 的转储文件名是写死的 `PROCESSNAME_PID.dmp`（它不会替换进程名和 PID），而 `-o` 允许覆盖，所以 `lertaro.app.exe` 与 `lertaro.service.exe` 同时运行时，后一份转储会覆盖前一份，ZIP 里只留下一份转储。
 
 ## 第三方组件
 

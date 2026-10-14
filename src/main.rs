@@ -522,9 +522,55 @@ mod system {
         r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
     ];
 
+    const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+    const UAC_ROOT: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+    const UAC_VALUES: [&str; 6] = [
+        "EnableLUA",
+        "ConsentPromptBehaviorAdmin",
+        "ConsentPromptBehaviorUser",
+        "PromptOnSecureDesktop",
+        "FilterAdministratorToken",
+        "LocalAccountTokenFilterPolicy",
+    ];
+
+    const FRAMEWORK_KEYS: [&str; 2] = [
+        r"HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full",
+        r"HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Client",
+    ];
+    // Microsoft documents 4.x as cumulative: the Release value names the newest build
+    // present, so every threshold below means "that version and its predecessors".
+    const FRAMEWORK_RELEASES: [(&str, u32); 11] = [
+        ("4.5", 378_389),
+        ("4.5.1", 379_893),
+        ("4.5.2", 380_522),
+        ("4.6", 393_297),
+        ("4.6.1", 394_294),
+        ("4.6.2", 394_802),
+        ("4.7", 460_793),
+        ("4.7.1", 461_308),
+        ("4.7.2", 461_808),
+        ("4.8", 528_040),
+        ("4.8.1", 533_320),
+    ];
+
+    const DOTNET_COMPONENTS: [&str; 3] = [
+        "shared/Microsoft.NETCore.App",
+        "shared/Microsoft.WindowsDesktop.App",
+        "sdk",
+    ];
+    const DOTNET_MAJORS: [u32; 4] = [7, 8, 9, 10];
+
     pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
         let _ = log.report("SYSTEM", "fastfetch.txt", fastfetch(output_dir));
         let _ = log.report("SYSTEM", "icacls.txt", permissions(output_dir, log));
+        let _ = log.report("SYSTEM", "account.txt", account(output_dir, log));
+        let _ = log.report("SYSTEM", "dotnet.txt", dotnet(output_dir, log));
+    }
+
+    fn console_text(program: &str, arguments: &[&str]) -> io::Result<String> {
+        let code_page = command::console_code_page();
+        let output = command::output(Command::new(program).args(arguments), code_page)?;
+        Ok(command::decode(&output.stdout, code_page))
     }
 
     fn output_directory(output_dir: &Path) -> io::Result<PathBuf> {
@@ -585,14 +631,198 @@ mod system {
         if !path.try_exists()? {
             return Ok("(directory does not exist)\r\n\r\n".to_owned());
         }
-        let code_page = command::console_code_page();
-        let output = command::output(Command::new("icacls.exe").arg(path), code_page)?;
-        let mut text = command::decode(&output.stdout, code_page);
+        let argument = path.to_string_lossy().into_owned();
+        let mut text = console_text("icacls.exe", &[&argument])?;
         if !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str("\r\n");
         Ok(text)
+    }
+
+    fn account(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
+        let mut text = String::new();
+        let mut groups = String::new();
+        for argument in ["/user", "/groups", "/priv"] {
+            let section = format!("whoami {argument}");
+            match log.report("ACCOUNT", &section, console_text("whoami.exe", &[argument])) {
+                Some(output) => {
+                    if argument == "/groups" {
+                        groups = output.clone();
+                    }
+                    text.push_str(&format!("[{section}]\r\n{output}\r\n"));
+                }
+                None => text.push_str(&format!("[{section}]\r\n(unavailable)\r\n")),
+            }
+        }
+
+        text.push_str(&format!("\r\n[UAC policy] {UAC_ROOT}\r\n"));
+        if let Some(values) = log.report("ACCOUNT", UAC_ROOT, registry_values(UAC_ROOT)) {
+            for name in UAC_VALUES {
+                let value = registry_value(&values, name).unwrap_or("(absent)");
+                text.push_str(&format!("{name} = {value}\r\n"));
+            }
+        }
+
+        // Both an elevated and a UAC-filtered token carry the Administrators SID, so its
+        // presence is what proves the account holds local administrator rights.
+        let admin = groups.contains(ADMINISTRATORS_SID);
+        let integrity = integrity(&groups);
+        text.push_str(&format!(
+            "\r\n[summary]\r\nlocal administrator: {}\r\nintegrity: {integrity}\r\nalready elevated: {}\r\n",
+            yes_no(admin),
+            yes_no(integrity.starts_with("High")),
+        ));
+        let path = output_directory(output_dir)?.join("account.txt");
+        write_text(&path, &text)
+    }
+
+    fn yes_no(value: bool) -> &'static str {
+        if value { "yes" } else { "no" }
+    }
+
+    fn integrity(groups: &str) -> String {
+        let sid = groups
+            .split_whitespace()
+            .find(|token| token.starts_with("S-1-16-"))
+            .unwrap_or("unknown");
+        let level = match sid {
+            "S-1-16-4096" => "Low",
+            "S-1-16-8192" => "Medium",
+            "S-1-16-12288" => "High",
+            "S-1-16-16384" => "System",
+            _ => "Unrecognized",
+        };
+        format!("{level} ({sid})")
+    }
+
+    fn dotnet(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
+        let mut text = String::new();
+        let mut release = None;
+        let mut installed = false;
+        text.push_str("[.NET Framework]\r\n");
+        for key in FRAMEWORK_KEYS {
+            match log.report("DOTNET", key, registry_values(key)) {
+                Some(values) => {
+                    text.push_str(&format!("{key}\r\n"));
+                    for name in ["Install", "Release", "Version"] {
+                        if let Some(value) = registry_value(&values, name) {
+                            text.push_str(&format!("    {name} = {value}\r\n"));
+                        }
+                    }
+                    installed = true;
+                    if release.is_none() {
+                        release = registry_value(&values, "Release").and_then(parse_release);
+                    }
+                }
+                None => text.push_str(&format!("{key} = (absent)\r\n")),
+            }
+        }
+        text.push_str("\r\n[framework checklist]\r\n");
+        text.push_str(&format!("4: {}\r\n", yes_no(installed)));
+        for (label, minimum) in [("4.5", 378_389), ("4.8", 528_040)] {
+            text.push_str(&format!(
+                "{label}: {}\r\n",
+                match release {
+                    Some(value) => yes_no(value >= minimum),
+                    None => "unknown",
+                }
+            ));
+        }
+        if let Some(value) = release {
+            text.push_str(&format!("at least: {}\r\n", framework_name(value)));
+        }
+
+        text.push_str("\r\n[.NET runtime and SDK]\r\n");
+        let mut versions: Vec<(&'static str, &'static str, String)> = Vec::new();
+        for (label, variable) in [("x64", "ProgramFiles"), ("x86", "ProgramFiles(x86)")] {
+            let Some(base) = std::env::var_os(variable) else {
+                log.error("DOTNET", variable, "environment variable is not set");
+                continue;
+            };
+            let root = Path::new(&base).join("dotnet");
+            if !root.try_exists()? {
+                text.push_str(&format!("{} ({label}) = (absent)\r\n", root.display()));
+                continue;
+            }
+            text.push_str(&format!("{} ({label})\r\n", root.display()));
+            for component in DOTNET_COMPONENTS {
+                let found = installed_versions(&root.join(component))?;
+                text.push_str(&format!(
+                    "    {component}: {}\r\n",
+                    if found.is_empty() {
+                        String::from("(none)")
+                    } else {
+                        found.join(", ")
+                    }
+                ));
+                versions.extend(found.into_iter().map(|version| (label, component, version)));
+            }
+        }
+        text.push_str("\r\n[dotnet checklist]\r\n");
+        for major in DOTNET_MAJORS {
+            let found: Vec<String> = versions
+                .iter()
+                .filter(|(_, _, version)| version_major(version) == Some(major))
+                .map(|(label, component, version)| {
+                    let leaf = component.rsplit('/').next().unwrap_or(component);
+                    format!("{leaf} {version} ({label})")
+                })
+                .collect();
+            text.push_str(&format!(
+                "{major}: {}\r\n",
+                if found.is_empty() {
+                    String::from("not installed")
+                } else {
+                    found.join("; ")
+                }
+            ));
+        }
+
+        let path = output_directory(output_dir)?.join("dotnet.txt");
+        write_text(&path, &text)
+    }
+
+    fn installed_versions(directory: &Path) -> io::Result<Vec<String>> {
+        if !directory.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let mut versions: Vec<String> = fs::read_dir(directory)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        versions.sort_by_key(|version| version_key(version));
+        Ok(versions)
+    }
+
+    fn version_key(version: &str) -> (u32, u32, u32) {
+        let mut parts = version
+            .split('.')
+            .map(|part| part.parse::<u32>().unwrap_or_default());
+        (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        )
+    }
+
+    fn version_major(version: &str) -> Option<u32> {
+        version.split('.').next()?.parse().ok()
+    }
+
+    fn parse_release(value: &str) -> Option<u32> {
+        u32::from_str_radix(value.trim().strip_prefix("0x")?, 16).ok()
+    }
+
+    fn framework_name(release: u32) -> &'static str {
+        let mut name = "4.0";
+        for (label, minimum) in FRAMEWORK_RELEASES {
+            if release >= minimum {
+                name = label;
+            }
+        }
+        name
     }
 
     fn install_dirs(log: &ErrorLog) -> Vec<(&'static str, PathBuf)> {
@@ -629,12 +859,18 @@ mod system {
     }
 
     fn registry_query(root: &str) -> io::Result<String> {
-        let code_page = command::console_code_page();
-        let output = command::output(
-            Command::new("reg.exe").args(["query", root, "/s"]),
-            code_page,
-        )?;
-        Ok(command::decode(&output.stdout, code_page))
+        console_text("reg.exe", &["query", root, "/s"])
+    }
+
+    fn registry_values(key: &str) -> io::Result<String> {
+        console_text("reg.exe", &["query", key])
+    }
+
+    fn registry_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+        text.lines()
+            .filter_map(parse_value)
+            .find(|(found, _)| found.eq_ignore_ascii_case(name))
+            .map(|(_, data)| data)
     }
 
     fn parse_value(line: &str) -> Option<(&str, &str)> {
@@ -662,9 +898,7 @@ mod system {
     }
 
     fn service_dir() -> io::Result<Option<PathBuf>> {
-        let code_page = command::console_code_page();
-        let output = command::output(Command::new("sc.exe").args(["qc", SERVICE_NAME]), code_page)?;
-        let text = command::decode(&output.stdout, code_page);
+        let text = console_text("sc.exe", &["qc", SERVICE_NAME])?;
         let line = text
             .lines()
             .find(|line| line.trim_start().starts_with("BINARY_PATH_NAME"))
