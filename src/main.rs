@@ -54,6 +54,9 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
         return Ok(());
     }
 
+    // Machine details and directory ACLs belong in every bundle, dump or no dump.
+    system::collect(&output_dir, &log);
+
     // An unsuccessful query is not evidence that all target processes have stopped.
     if let Some(processes) = log.report("PROCESSES", "query", processes::running()) {
         if processes.is_empty() {
@@ -333,7 +336,14 @@ mod tools {
     pub(super) fn procdump(output_dir: &Path) -> io::Result<PathBuf> {
         extract(
             output_dir,
-            &[("procdump.exe", include_bytes!("../procdump.exe"))],
+            &[("procdump.exe", include_bytes!("../res/procdump.exe"))],
+        )
+    }
+
+    pub(super) fn fastfetch(output_dir: &Path) -> io::Result<PathBuf> {
+        extract(
+            output_dir,
+            &[("fastfetch.exe", include_bytes!("../res/fastfetch.exe"))],
         )
     }
 
@@ -341,8 +351,8 @@ mod tools {
         extract(
             output_dir,
             &[
-                ("7z.exe", include_bytes!("../7z.exe")),
-                ("7z.dll", include_bytes!("../7z.dll")),
+                ("7z.exe", include_bytes!("../res/7z.exe")),
+                ("7z.dll", include_bytes!("../res/7z.dll")),
             ],
         )
     }
@@ -491,6 +501,206 @@ mod logs {
             fs::copy(source, destination)?;
         }
         Ok(())
+    }
+}
+
+mod system {
+    use super::{ErrorLog, command, tools};
+    use std::{
+        fs, io,
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    const PRODUCT: &str = "lertaro";
+    const SERVICE_NAME: &str = "LertaroService";
+    // An x64 process reads the 64-bit registry view, so the 32-bit and per-user
+    // uninstall roots have to be enumerated as well.
+    const UNINSTALL_ROOTS: [&str; 3] = [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    ];
+
+    pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
+        let _ = log.report("SYSTEM", "fastfetch.txt", fastfetch(output_dir));
+        let _ = log.report("SYSTEM", "icacls.txt", permissions(output_dir, log));
+    }
+
+    fn output_directory(output_dir: &Path) -> io::Result<PathBuf> {
+        let directory = output_dir.join("system");
+        fs::create_dir_all(&directory)?;
+        Ok(directory)
+    }
+
+    fn write_text(path: &Path, text: &str) -> io::Result<()> {
+        // A BOM lets Windows text editors recognize UTF-8 in any system locale.
+        fs::write(path, format!("\u{feff}{text}"))
+    }
+
+    fn fastfetch(output_dir: &Path) -> io::Result<()> {
+        let executable = tools::fastfetch(output_dir)?;
+        // --logo None keeps the report plain text instead of ASCII art.
+        let output = command::output(
+            Command::new(executable).args(["--logo", "None"]),
+            command::UTF8,
+        )?;
+        let path = output_directory(output_dir)?.join("fastfetch.txt");
+        write_text(&path, &command::decode(&output.stdout, command::UTF8))
+    }
+
+    fn permissions(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
+        let mut targets: Vec<(&'static str, PathBuf)> = Vec::new();
+        for (label, path) in install_dirs(log) {
+            push(&mut targets, label, path);
+        }
+        for (label, variable) in [
+            ("config-user", "LOCALAPPDATA"),
+            ("config-machine", "ProgramData"),
+        ] {
+            let Some(base) = std::env::var_os(variable) else {
+                log.error("PERMS", variable, "environment variable is not set");
+                continue;
+            };
+            push(&mut targets, label, Path::new(&base).join("Lertaro"));
+        }
+
+        let mut text = String::new();
+        for (label, path) in &targets {
+            text.push_str(&format!("[{label}] {}\r\n", path.display()));
+            text.push_str(&match describe(path) {
+                // A failure is a finding: keep it in the report next to its directory.
+                Ok(output) => output,
+                Err(error) => format!("({error})\r\n\r\n"),
+            });
+        }
+        if targets.is_empty() {
+            text.push_str("(no directory to inspect)\r\n");
+        }
+        let path = output_directory(output_dir)?.join("icacls.txt");
+        write_text(&path, &text)
+    }
+
+    fn describe(path: &Path) -> io::Result<String> {
+        if !path.try_exists()? {
+            return Ok("(directory does not exist)\r\n\r\n".to_owned());
+        }
+        let code_page = command::console_code_page();
+        let output = command::output(Command::new("icacls.exe").arg(path), code_page)?;
+        let mut text = command::decode(&output.stdout, code_page);
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("\r\n");
+        Ok(text)
+    }
+
+    fn install_dirs(log: &ErrorLog) -> Vec<(&'static str, PathBuf)> {
+        let mut dirs: Vec<(&'static str, PathBuf)> = Vec::new();
+        for root in UNINSTALL_ROOTS {
+            let Some(text) = log.report("INSTALL", root, registry_query(root)) else {
+                continue;
+            };
+            parse_uninstall(&text, &mut dirs);
+        }
+        // The service image path is where lertaro.service.exe really runs from, which
+        // outranks the installer's record after a manual move or a development build.
+        if let Some(path) = log.report("INSTALL", SERVICE_NAME, service_dir()).flatten() {
+            push(&mut dirs, "install-service", path);
+        }
+        dirs
+    }
+
+    fn parse_uninstall(text: &str, dirs: &mut Vec<(&'static str, PathBuf)>) {
+        let mut values: Vec<(&str, &str)> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with("HKEY_") {
+                if let Some(path) = install_location(&values) {
+                    push(dirs, "install-registry", path);
+                }
+                values.clear();
+            } else if let Some(value) = parse_value(line) {
+                values.push(value);
+            }
+        }
+        if let Some(path) = install_location(&values) {
+            push(dirs, "install-registry", path);
+        }
+    }
+
+    fn registry_query(root: &str) -> io::Result<String> {
+        let code_page = command::console_code_page();
+        let output = command::output(
+            Command::new("reg.exe").args(["query", root, "/s"]),
+            code_page,
+        )?;
+        Ok(command::decode(&output.stdout, code_page))
+    }
+
+    fn parse_value(line: &str) -> Option<(&str, &str)> {
+        // reg writes every value as `name    REG_TYPE    data`, indented by four spaces.
+        let mut fields = line.trim_start().splitn(3, "    ");
+        let name = fields.next()?.trim_end();
+        let _ = fields.next()?;
+        Some((name, fields.next()?.trim()))
+    }
+
+    fn install_location(values: &[(&str, &str)]) -> Option<PathBuf> {
+        if !values.iter().any(|(name, data)| {
+            name.eq_ignore_ascii_case("DisplayName") && data.to_ascii_lowercase().contains(PRODUCT)
+        }) {
+            return None;
+        }
+        ["InstallLocation", "Inno Setup: App Path"]
+            .iter()
+            .find_map(|key| {
+                values
+                    .iter()
+                    .find(|(name, data)| name.eq_ignore_ascii_case(key) && !data.is_empty())
+                    .map(|(_, data)| PathBuf::from(data))
+            })
+    }
+
+    fn service_dir() -> io::Result<Option<PathBuf>> {
+        let code_page = command::console_code_page();
+        let output = command::output(Command::new("sc.exe").args(["qc", SERVICE_NAME]), code_page)?;
+        let text = command::decode(&output.stdout, code_page);
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("BINARY_PATH_NAME"))
+            .ok_or_else(|| io::Error::other("BINARY_PATH_NAME is missing"))?;
+        let value = line
+            .split_once(':')
+            .map(|(_, value)| value.trim())
+            .ok_or_else(|| io::Error::other("unexpected service configuration format"))?;
+        let executable = value
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.split('"').next())
+            .unwrap_or(value)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        Ok(Path::new(executable)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf))
+    }
+
+    // Registry values, service image paths and environment variables describe the same
+    // directory differently, so compare them as trimmed, case-folded text.
+    fn push(targets: &mut Vec<(&'static str, PathBuf)>, label: &'static str, path: PathBuf) {
+        let text = path
+            .to_string_lossy()
+            .trim_matches(['"', ' ', '/', '\\'])
+            .to_owned();
+        if text.is_empty()
+            || targets
+                .iter()
+                .any(|(_, existing)| existing.to_string_lossy().eq_ignore_ascii_case(&text))
+        {
+            return;
+        }
+        targets.push((label, PathBuf::from(text)));
     }
 }
 
