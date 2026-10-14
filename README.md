@@ -27,13 +27,14 @@
 | 5 | `whoami.exe` | `/user`、`/groups`、`/priv` | 采集账户、令牌组与完整性级别、权限列表 |
 | 6 | `reg.exe` | `query HKLM\...\CurrentVersion\Policies\System` | 读 UAC 策略值（`EnableLUA` 等），判断账户能否请求管理员 → `system\account.txt` |
 | 7 | `reg.exe` + 目录扫描 | `query HKLM\...\NET Framework Setup\NDP\v4\Full`、`v4\Client`；列 `%ProgramFiles%\dotnet` 与 `%ProgramFiles(x86)%\dotnet` 下的版本目录 | 采集 .NET Framework 与 .NET 7/8/9/10 安装情况 → `system\dotnet.txt` |
-| 8 | `tasklist.exe` | `/FO CSV /NH` | 判断 `lertaro.app.exe`、`lertaro.service.exe` 是否在运行，决定走哪条采集分支 |
-| 9a | `.dump_tools\procdump.exe` | `-accepteula -ma -o <PID> PROCESSNAME_PID.dmp` | **进程仍在运行时**：抓取完整内存转储，文件名里的 `PROCESSNAME`、`PID` 由 Procdump 替换为 `<进程名>_<进程ID>.dmp` |
-| 9b | `wevtutil.exe` | `qe Application/System /rd:true /f:RenderedXml /e:Events /uni:true /q:<XPath>` | **进程未运行时**：取最近 24 小时、文本中提到 Lertaro 的错误事件 → `crash\events\*.xml` |
-| 10 | 自身文件复制 | — | 日志、WER 崩溃报告、系统 CrashDumps 目录中的 Lertaro dump |
-| 11 | `.dump_tools\7z.exe` | `a -tzip -mx=0 ...` | 打包 ZIP（`-mx=0` 为不压缩，避免大 dump 反复压缩耗时） |
+| 8 | 自身文件复制 | — | `%LOCALAPPDATA%\Lertaro\logs\**` 与 `%ProgramData%\Lertaro\logs\service.log` → `logs\` |
+| 9 | `wevtutil.exe` | `qe Application/System /rd:true /f:RenderedXml /e:Events /uni:true /q:<XPath>` | 最近 24 小时、正文提到 Lertaro 的错误事件 → `crash\events\*.xml` |
+| 10 | 自身文件复制 | — | WER 报告与四个 `CrashDumps` 目录里已有的 Lertaro 转储 → `crash\wer\`、`crash\dumps\` |
+| 11 | `tasklist.exe` | `/FO CSV /NH` | 判断 `lertaro.app.exe`、`lertaro.service.exe` 是否在运行 |
+| 12 | `.dump_tools\procdump.exe` | `-accepteula -ma -o <PID> PROCESSNAME_PID.dmp` | **仅当目标进程在运行**：抓完整内存转储，`PROCESSNAME`、`PID` 由 Procdump 替换成 `<进程名>_<进程ID>` |
+| 13 | `.dump_tools\7z.exe` | `a -tzip -mx=0 ...` | 打包 ZIP（`-mx=0` 为不压缩，避免大 dump 反复压缩耗时） |
 
-第 1–7 步在两种分支下都会执行。
+第 1–10 与第 13 步每次运行都做，只有第 12 步取决于进程是否在运行；也就是说不管 Lertaro 有没有在跑，日志和系统里已有的崩溃转储都会一并收走。
 
 内嵌的 fastfetch / procdump / 7-Zip 在运行时解压到 `dump_file\.dump_tools\`（与采集目录同级，不会被写进 ZIP），运行结束后**不会自动删除**，可自行清理。
 
@@ -43,19 +44,19 @@
 
 每一步打印一行状态，并在运行期间每秒刷新自己的耗时，避免长时间看起来像卡住：
 
-```
+```log
 正在采集系统信息（0 min 2 s）
 正在读取目录权限（0 min 3 s）
 正在检查账户权限（0 min 1 s）
 正在检查 .NET 环境（0 min 1 s）
-正在检查 Lertaro 进程（0 min 1 s）
-正在转储 lertaro.app.exe (PID 19252)（0 min 12 s）      ← 仅目标进程在运行时
-正在复制应用日志（0 min 1 s）                            ← 仅目标进程未运行时
+正在复制应用日志（0 min 1 s）
 正在查询事件日志（0 min 4 s）
 正在收集崩溃报告（0 min 1 s）
 正在收集崩溃转储（0 min 0 s）
+正在检查 Lertaro 进程（0 min 1 s）
+正在转储 lertaro.app.exe (PID 19252)（0 min 12 s）      ← 仅目标进程在运行时
 正在压缩诊断文件（1 min 20 s）
-诊断包已生成：dump_file\2026-10-14_20-24-21-723-22052.zip
+诊断包已生成：dump_file\2026-10-14_20-45-46-654-32260.zip
 ```
 
 同一行原地刷新，结束时保留最终耗时并换行。失败信息仍然走标准错误，格式是 `[时间][ERROR][模块]: 上下文: 原因`，同时写进 `run.log`。
@@ -94,10 +95,14 @@
 
 ### 5. 日志文件（只读复制，不移动、不删除、不修改源文件）
 
+不论 Lertaro 此刻有没有在运行，下面这些都会收走：
+
 - `%LOCALAPPDATA%\Lertaro\logs\**` → `logs\user\`（递归复制全部用户日志；日志内容可能包含访问过的文件名与路径、搜索关键字等）
 - `%ProgramData%\Lertaro\logs\service.log` → `logs\service\`
 
 ### 6. 崩溃相关
+
+同样无条件收集：
 
 - Windows 事件查看器 Application / System 通道最近 24 小时的错误事件，且事件正文中提到 Lertaro 的才写入 `crash\events\`
 - Windows 错误报告（WER）`ReportArchive`、`ReportQueue` 中报告对象为 Lertaro 程序的文件夹 → `crash\wer\<user|machine>\`（内含计算机名、用户名、模块路径等）
@@ -106,7 +111,7 @@
 
 ### 7. 其他
 
-`run.log` 记录本次运行中失败的步骤；进程列表本身只用于判断分支，不会整份写入 ZIP。
+`run.log` 记录本次运行中失败的步骤；进程列表本身只用来决定要不要额外抓内存转储，不会整份写入 ZIP。
 
 ## 不做什么
 
@@ -118,7 +123,7 @@
 
 ## 产物结构
 
-```
+```tree
 <程序所在目录>\
 ├─ get_dump_full.exe
 └─ dump_file\

@@ -57,19 +57,20 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
 
     // Machine, permission and runtime details belong in every bundle, dump or no dump.
     system::collect(&output_dir, &log);
+    // Logs and previously written crash artifacts describe the failure just as well while
+    // the app is still running, so they are collected before the dump decision.
+    diagnostics::collect(&output_dir, &log);
 
     // An unsuccessful query is not evidence that all target processes have stopped.
     let processes = status::run("正在检查 Lertaro 进程", processes::running);
-    if let Some(processes) = log.report("PROCESSES", "query", processes) {
-        if processes.is_empty() {
-            diagnostics::collect(&output_dir, &log);
-        } else {
-            let _ = log.report(
-                "DUMP",
-                "collect",
-                dump::collect(&output_dir, &processes, &log),
-            );
-        }
+    if let Some(processes) = log.report("PROCESSES", "query", processes)
+        && !processes.is_empty()
+    {
+        let _ = log.report(
+            "DUMP",
+            "collect",
+            dump::collect(&output_dir, &processes, &log),
+        );
     }
     let archived = status::run("正在压缩诊断文件", || archive::create(&output_dir));
     if let Some(zip) = log.report("ZIP", "archive", archived) {
