@@ -2,6 +2,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self},
+    path::PathBuf,
 };
 
 use error_log::ErrorLog;
@@ -80,6 +81,12 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
 fn pause() {
     println!("Press Enter to continue...");
     let _ = io::stdin().read_line(&mut String::new());
+}
+
+fn environment_path(variable: &str) -> io::Result<PathBuf> {
+    let value = std::env::var_os(variable)
+        .ok_or_else(|| io::Error::other("environment variable is not set"))?;
+    Ok(PathBuf::from(value))
 }
 
 mod status {
@@ -263,11 +270,30 @@ mod error_log {
 
 mod command {
     use std::{
+        ffi::OsStr,
         io,
         process::{Command, Output},
     };
 
     pub(super) const UTF8: u32 = 65001;
+
+    /// Runs a program with the console's output code page and returns its stdout text.
+    pub(super) fn text<C: AsRef<OsStr>>(program: C, arguments: &[&str]) -> io::Result<String> {
+        text_with(program, arguments, console_code_page())
+    }
+
+    pub(super) fn text_utf8<C: AsRef<OsStr>>(program: C, arguments: &[&str]) -> io::Result<String> {
+        text_with(program, arguments, UTF8)
+    }
+
+    fn text_with<C: AsRef<OsStr>>(
+        program: C,
+        arguments: &[&str],
+        code_page: u32,
+    ) -> io::Result<String> {
+        let captured = output(Command::new(program).args(arguments), code_page)?;
+        Ok(decode(&captured.stdout, code_page))
+    }
 
     pub(super) fn output(command: &mut Command, code_page: u32) -> io::Result<Output> {
         check(command.output()?, code_page)
@@ -449,7 +475,7 @@ mod tools {
 
 mod processes {
     use super::command;
-    use std::{fmt, io, process::Command};
+    use std::{ffi::OsStr, fmt, io};
 
     pub(super) const TARGET_NAMES: [&str; 2] = ["lertaro.app.exe", "lertaro.service.exe"];
 
@@ -465,12 +491,25 @@ mod processes {
     }
 
     pub(super) fn running() -> io::Result<Vec<Process>> {
-        let code_page = command::console_code_page();
-        let output = command::output(
-            Command::new("tasklist").args(["/FO", "CSV", "/NH"]),
-            code_page,
-        )?;
-        Ok(parse(&command::decode(&output.stdout, code_page)))
+        Ok(parse(&command::text(
+            "tasklist.exe",
+            &["/FO", "CSV", "/NH"],
+        )?))
+    }
+
+    pub(super) fn is_target(name: &str) -> bool {
+        TARGET_NAMES
+            .iter()
+            .any(|target| name.eq_ignore_ascii_case(target))
+    }
+
+    /// WER's local crash dumps are named `<executable name>.<pid>.dmp`.
+    pub(super) fn is_dump_name(name: &OsStr) -> bool {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name.ends_with(".dmp")
+            && TARGET_NAMES
+                .iter()
+                .any(|target| name.starts_with(&format!("{target}.")))
     }
 
     pub(super) fn parse(output: &str) -> Vec<Process> {
@@ -547,7 +586,7 @@ mod dump {
 }
 
 mod logs {
-    use super::ErrorLog;
+    use super::{ErrorLog, environment_path};
     use std::{fs, io, path::Path};
 
     const SOURCES: [(&str, &str, &str); 2] = [
@@ -561,11 +600,10 @@ mod logs {
 
     pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
         for (variable, relative_source, relative_destination) in SOURCES {
-            let Some(base) = std::env::var_os(variable) else {
-                log.error("LOGS", variable, "environment variable is not set");
+            let Some(base) = log.report("LOGS", variable, environment_path(variable)) else {
                 continue;
             };
-            let source = Path::new(&base).join(relative_source);
+            let source = base.join(relative_source);
             let destination = output_dir.join(relative_destination);
             let _ = log.report(
                 "LOGS",
@@ -600,11 +638,10 @@ mod logs {
 }
 
 mod system {
-    use super::{ErrorLog, command, status, tools};
+    use super::{ErrorLog, command, environment_path, status, tools};
     use std::{
         fs, io,
         path::{Path, PathBuf},
-        process::Command,
     };
 
     const PRODUCT: &str = "lertaro";
@@ -678,32 +715,17 @@ mod system {
         );
     }
 
-    fn console_text(program: &str, arguments: &[&str]) -> io::Result<String> {
-        let code_page = command::console_code_page();
-        let output = command::output(Command::new(program).args(arguments), code_page)?;
-        Ok(command::decode(&output.stdout, code_page))
-    }
-
-    fn output_directory(output_dir: &Path) -> io::Result<PathBuf> {
+    fn write_report(output_dir: &Path, name: &str, text: &str) -> io::Result<()> {
         let directory = output_dir.join("system");
         fs::create_dir_all(&directory)?;
-        Ok(directory)
-    }
-
-    fn write_text(path: &Path, text: &str) -> io::Result<()> {
         // A BOM lets Windows text editors recognize UTF-8 in any system locale.
-        fs::write(path, format!("\u{feff}{text}"))
+        fs::write(directory.join(name), format!("\u{feff}{text}"))
     }
 
     fn fastfetch(output_dir: &Path) -> io::Result<()> {
-        let executable = tools::fastfetch(output_dir)?;
         // --logo None keeps the report plain text instead of ASCII art.
-        let output = command::output(
-            Command::new(executable).args(["--logo", "None"]),
-            command::UTF8,
-        )?;
-        let path = output_directory(output_dir)?.join("fastfetch.txt");
-        write_text(&path, &command::decode(&output.stdout, command::UTF8))
+        let text = command::text_utf8(tools::fastfetch(output_dir)?, &["--logo", "None"])?;
+        write_report(output_dir, "fastfetch.txt", &text)
     }
 
     fn permissions(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
@@ -715,11 +737,10 @@ mod system {
             ("config-user", "LOCALAPPDATA"),
             ("config-machine", "ProgramData"),
         ] {
-            let Some(base) = std::env::var_os(variable) else {
-                log.error("PERMS", variable, "environment variable is not set");
+            let Some(base) = log.report("PERMS", variable, environment_path(variable)) else {
                 continue;
             };
-            push(&mut targets, label, Path::new(&base).join("Lertaro"));
+            push(&mut targets, label, base.join("Lertaro"));
         }
 
         let mut text = String::new();
@@ -734,16 +755,14 @@ mod system {
         if targets.is_empty() {
             text.push_str("(no directory to inspect)\r\n");
         }
-        let path = output_directory(output_dir)?.join("icacls.txt");
-        write_text(&path, &text)
+        write_report(output_dir, "icacls.txt", &text)
     }
 
     fn describe(path: &Path) -> io::Result<String> {
         if !path.try_exists()? {
             return Ok("(directory does not exist)\r\n\r\n".to_owned());
         }
-        let argument = path.to_string_lossy().into_owned();
-        let mut text = console_text("icacls.exe", &[&argument])?;
+        let mut text = command::text("icacls.exe", &[&path.to_string_lossy()])?;
         if !text.ends_with('\n') {
             text.push('\n');
         }
@@ -756,7 +775,11 @@ mod system {
         let mut groups = String::new();
         for argument in ["/user", "/groups", "/priv"] {
             let section = format!("whoami {argument}");
-            match log.report("ACCOUNT", &section, console_text("whoami.exe", &[argument])) {
+            match log.report(
+                "ACCOUNT",
+                &section,
+                command::text("whoami.exe", &[argument]),
+            ) {
                 Some(output) => {
                     if argument == "/groups" {
                         groups = output.clone();
@@ -784,8 +807,7 @@ mod system {
             yes_no(admin),
             yes_no(integrity.starts_with("High")),
         ));
-        let path = output_directory(output_dir)?.join("account.txt");
-        write_text(&path, &text)
+        write_report(output_dir, "account.txt", &text)
     }
 
     fn yes_no(value: bool) -> &'static str {
@@ -847,11 +869,10 @@ mod system {
         text.push_str("\r\n[.NET runtime and SDK]\r\n");
         let mut versions: Vec<(&'static str, &'static str, String)> = Vec::new();
         for (label, variable) in [("x64", "ProgramFiles"), ("x86", "ProgramFiles(x86)")] {
-            let Some(base) = std::env::var_os(variable) else {
-                log.error("DOTNET", variable, "environment variable is not set");
+            let Some(base) = log.report("DOTNET", variable, environment_path(variable)) else {
                 continue;
             };
-            let root = Path::new(&base).join("dotnet");
+            let root = base.join("dotnet");
             if !root.try_exists()? {
                 text.push_str(&format!("{} ({label}) = (absent)\r\n", root.display()));
                 continue;
@@ -890,8 +911,7 @@ mod system {
             ));
         }
 
-        let path = output_directory(output_dir)?.join("dotnet.txt");
-        write_text(&path, &text)
+        write_report(output_dir, "dotnet.txt", &text)
     }
 
     fn installed_versions(directory: &Path) -> io::Result<Vec<String>> {
@@ -970,11 +990,11 @@ mod system {
     }
 
     fn registry_query(root: &str) -> io::Result<String> {
-        console_text("reg.exe", &["query", root, "/s"])
+        command::text("reg.exe", &["query", root, "/s"])
     }
 
     fn registry_values(key: &str) -> io::Result<String> {
-        console_text("reg.exe", &["query", key])
+        command::text("reg.exe", &["query", key])
     }
 
     fn registry_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -1009,7 +1029,7 @@ mod system {
     }
 
     fn service_dir() -> io::Result<Option<PathBuf>> {
-        let text = console_text("sc.exe", &["qc", SERVICE_NAME])?;
+        let text = command::text("sc.exe", &["qc", SERVICE_NAME])?;
         let line = text
             .lines()
             .find(|line| line.trim_start().starts_with("BINARY_PATH_NAME"))
@@ -1050,8 +1070,8 @@ mod system {
 }
 
 mod diagnostics {
-    use super::{ErrorLog, command, logs, processes, status};
-    use std::{ffi::OsStr, fs, io, path::Path, process::Command};
+    use super::{ErrorLog, command, environment_path, logs, processes, status};
+    use std::{ffi::OsStr, fs, io, path::Path};
 
     // wevtutil and these event schemas are available on Windows 10.
     pub(super) const APPLICATION_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and ((Provider[@Name='Application Error'] and EventID=1000) or (Provider[@Name='.NET Runtime'] and EventID=1026) or (Provider[@Name='Windows Error Reporting'] and EventID=1001))]]";
@@ -1074,16 +1094,17 @@ mod diagnostics {
         });
         let _ = status::run("正在收集崩溃报告", || {
             for (variable, label) in [("LOCALAPPDATA", "user"), ("ProgramData", "machine")] {
-                if let Some(base) = std::env::var_os(variable) {
-                    for queue in ["ReportArchive", "ReportQueue"] {
-                        let source = Path::new(&base).join("Microsoft/Windows/WER").join(queue);
-                        let destination = output_dir.join("crash/wer").join(label).join(queue);
-                        let _ = log.report(
-                            "WER",
-                            source.display(),
-                            copy_reports(&source, &destination, log),
-                        );
-                    }
+                let Some(base) = log.report("WER", variable, environment_path(variable)) else {
+                    continue;
+                };
+                for queue in ["ReportArchive", "ReportQueue"] {
+                    let source = base.join("Microsoft/Windows/WER").join(queue);
+                    let destination = output_dir.join("crash/wer").join(label).join(queue);
+                    let _ = log.report(
+                        "WER",
+                        source.display(),
+                        copy_reports(&source, &destination, log),
+                    );
                 }
             }
             Ok(())
@@ -1107,38 +1128,36 @@ mod diagnostics {
                     "network-service",
                 ),
             ] {
-                if let Some(base) = std::env::var_os(variable) {
-                    let source = Path::new(&base).join(suffix);
-                    let destination = output_dir.join("crash/dumps").join(label);
-                    let _ = log.report(
-                        "CRASHDUMPS",
-                        source.display(),
-                        copy_dumps(&source, &destination, log),
-                    );
-                }
+                let Some(base) = log.report("CRASHDUMPS", variable, environment_path(variable))
+                else {
+                    continue;
+                };
+                let source = base.join(suffix);
+                let destination = output_dir.join("crash/dumps").join(label);
+                let _ = log.report(
+                    "CRASHDUMPS",
+                    source.display(),
+                    copy_dumps(&source, &destination, log),
+                );
             }
             Ok(())
         });
     }
 
     fn collect_events(channel: &str, query: &str, output_dir: &Path) -> io::Result<()> {
-        let output = command::output(
-            Command::new("wevtutil.exe")
-                .args([
-                    "qe",
-                    channel,
-                    "/rd:true",
-                    "/f:RenderedXml",
-                    "/e:Events",
-                    "/uni:true",
-                ])
-                .arg(format!("/q:{query}")),
-            command::console_code_page(),
-        )?;
-        let events = filter_events(&command::decode(
-            &output.stdout,
-            command::console_code_page(),
-        ));
+        let filter = format!("/q:{query}");
+        let events = filter_events(&command::text(
+            "wevtutil.exe",
+            &[
+                "qe",
+                channel,
+                "/rd:true",
+                "/f:RenderedXml",
+                "/e:Events",
+                "/uni:true",
+                &filter,
+            ],
+        )?);
         if !events.is_empty() {
             let directory = output_dir.join("crash/events");
             fs::create_dir_all(&directory)?;
@@ -1203,11 +1222,7 @@ mod diagnostics {
                 Path::new(value.trim().trim_matches('"'))
                     .file_name()
                     .and_then(OsStr::to_str)
-                    .is_some_and(|name| {
-                        processes::TARGET_NAMES
-                            .iter()
-                            .any(|target| target.eq_ignore_ascii_case(name))
-                    })
+                    .is_some_and(processes::is_target)
             })
     }
 
@@ -1255,14 +1270,6 @@ mod diagnostics {
         Ok(())
     }
 
-    pub(super) fn is_target_dump(name: &OsStr) -> bool {
-        let name = name.to_string_lossy().to_ascii_lowercase();
-        name.ends_with(".dmp")
-            && processes::TARGET_NAMES
-                .iter()
-                .any(|target| name.starts_with(&format!("{target}.")))
-    }
-
     pub(super) fn copy_dumps(source: &Path, destination: &Path, log: &ErrorLog) -> io::Result<()> {
         if !source.try_exists()? {
             return Ok(());
@@ -1271,7 +1278,7 @@ mod diagnostics {
             let Some(entry) = log.report("CRASHDUMPS", source.display(), entry) else {
                 continue;
             };
-            if !is_target_dump(&entry.file_name()) {
+            if !processes::is_dump_name(&entry.file_name()) {
                 continue;
             }
             let path = entry.path();
