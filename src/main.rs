@@ -1,7 +1,7 @@
 use std::{
     ffi::OsStr,
     fs,
-    io::{self, IsTerminal},
+    io::{self},
 };
 
 use error_log::ErrorLog;
@@ -54,11 +54,12 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
         return Ok(());
     }
 
-    // Machine details and directory ACLs belong in every bundle, dump or no dump.
+    // Machine, permission and runtime details belong in every bundle, dump or no dump.
     system::collect(&output_dir, &log);
 
     // An unsuccessful query is not evidence that all target processes have stopped.
-    if let Some(processes) = log.report("PROCESSES", "query", processes::running()) {
+    let processes = status::run("正在检查 Lertaro 进程", processes::running);
+    if let Some(processes) = log.report("PROCESSES", "query", processes) {
         if processes.is_empty() {
             diagnostics::collect(&output_dir, &log);
         } else {
@@ -69,15 +70,103 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
             );
         }
     }
-    let _ = log.report("ZIP", "archive", archive::create(&output_dir));
+    let archived = status::run("正在压缩诊断文件", || archive::create(&output_dir));
+    if let Some(zip) = log.report("ZIP", "archive", archived) {
+        println!("诊断包已生成：{}", zip.display());
+    }
     Ok(())
 }
 
 fn pause() {
-    let stdin = io::stdin();
-    if stdin.is_terminal() {
-        println!("Press Enter to continue...");
-        let _ = stdin.read_line(&mut String::new());
+    println!("Press Enter to continue...");
+    let _ = io::stdin().read_line(&mut String::new());
+}
+
+mod status {
+    use std::{
+        io::{self, Write},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    /// Runs a step while its label line refreshes its own elapsed time once a second, so
+    /// a multi-minute dump or archive never looks like a hang.
+    pub(super) fn run<T>(label: &str, work: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let stage = Stage::start(label);
+        let result = work();
+        stage.finish();
+        result
+    }
+
+    struct Stage {
+        label: String,
+        started: Instant,
+        stop: Arc<AtomicBool>,
+        ticker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Stage {
+        fn start(label: &str) -> Self {
+            let started = Instant::now();
+            let label = label.to_owned();
+            print_line(&label, started.elapsed());
+            let stop = Arc::new(AtomicBool::new(false));
+            let ticker = {
+                let (label, stop) = (label.clone(), Arc::clone(&stop));
+                thread::spawn(move || {
+                    loop {
+                        thread::sleep(Duration::from_secs(1));
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        print_line(&label, started.elapsed());
+                    }
+                })
+            };
+            Self {
+                label,
+                started,
+                stop,
+                ticker: Some(ticker),
+            }
+        }
+
+        fn halt(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(ticker) = self.ticker.take() {
+                let _ = ticker.join();
+            }
+        }
+
+        fn finish(mut self) {
+            self.halt();
+            println!(
+                "\r{}（{}）",
+                self.label,
+                elapsed_text(self.started.elapsed())
+            );
+        }
+    }
+
+    impl Drop for Stage {
+        fn drop(&mut self) {
+            self.halt();
+        }
+    }
+
+    fn print_line(label: &str, elapsed: Duration) {
+        // The trailing space covers a render shorter than the previous one.
+        print!("\r{}（{}） ", label, elapsed_text(elapsed));
+        let _ = io::stdout().flush();
+    }
+
+    fn elapsed_text(elapsed: Duration) -> String {
+        let seconds = elapsed.as_secs();
+        format!("{} min {} s", seconds / 60, seconds % 60)
     }
 }
 
@@ -401,7 +490,7 @@ mod processes {
 }
 
 mod dump {
-    use super::{ErrorLog, command, processes, tools};
+    use super::{ErrorLog, command, processes, status, tools};
     use std::{
         io,
         path::Path,
@@ -415,7 +504,13 @@ mod dump {
     ) -> io::Result<()> {
         let executable = tools::procdump(output_dir)?;
         for process in processes {
-            let _ = log.report("DUMP", process, create(&executable, output_dir, process));
+            let _ = log.report(
+                "DUMP",
+                process,
+                status::run(&format!("正在转储 {process}"), || {
+                    create(&executable, output_dir, process)
+                }),
+            );
         }
         Ok(())
     }
@@ -505,7 +600,7 @@ mod logs {
 }
 
 mod system {
-    use super::{ErrorLog, command, tools};
+    use super::{ErrorLog, command, status, tools};
     use std::{
         fs, io,
         path::{Path, PathBuf},
@@ -561,10 +656,26 @@ mod system {
     const DOTNET_MAJORS: [u32; 4] = [7, 8, 9, 10];
 
     pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
-        let _ = log.report("SYSTEM", "fastfetch.txt", fastfetch(output_dir));
-        let _ = log.report("SYSTEM", "icacls.txt", permissions(output_dir, log));
-        let _ = log.report("SYSTEM", "account.txt", account(output_dir, log));
-        let _ = log.report("SYSTEM", "dotnet.txt", dotnet(output_dir, log));
+        let _ = log.report(
+            "SYSTEM",
+            "fastfetch.txt",
+            status::run("正在采集系统信息", || fastfetch(output_dir)),
+        );
+        let _ = log.report(
+            "SYSTEM",
+            "icacls.txt",
+            status::run("正在读取目录权限", || permissions(output_dir, log)),
+        );
+        let _ = log.report(
+            "SYSTEM",
+            "account.txt",
+            status::run("正在检查账户权限", || account(output_dir, log)),
+        );
+        let _ = log.report(
+            "SYSTEM",
+            "dotnet.txt",
+            status::run("正在检查 .NET 环境", || dotnet(output_dir, log)),
+        );
     }
 
     fn console_text(program: &str, arguments: &[&str]) -> io::Result<String> {
@@ -939,7 +1050,7 @@ mod system {
 }
 
 mod diagnostics {
-    use super::{ErrorLog, command, logs, processes};
+    use super::{ErrorLog, command, logs, processes, status};
     use std::{ffi::OsStr, fs, io, path::Path, process::Command};
 
     // wevtutil and these event schemas are available on Windows 10.
@@ -947,57 +1058,67 @@ mod diagnostics {
     pub(super) const SYSTEM_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and Provider[@Name='Service Control Manager'] and (EventID=7000 or EventID=7001 or EventID=7009 or EventID=7011 or EventID=7022 or EventID=7023 or EventID=7024 or EventID=7031 or EventID=7034)]]";
 
     pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
-        logs::collect(output_dir, log);
-        for (channel, query) in [("Application", APPLICATION_QUERY), ("System", SYSTEM_QUERY)] {
-            let _ = log.report(
-                "EVENTS",
-                channel,
-                collect_events(channel, query, output_dir),
-            );
-        }
-
-        for (variable, label) in [("LOCALAPPDATA", "user"), ("ProgramData", "machine")] {
-            if let Some(base) = std::env::var_os(variable) {
-                for queue in ["ReportArchive", "ReportQueue"] {
-                    let source = Path::new(&base).join("Microsoft/Windows/WER").join(queue);
-                    let destination = output_dir.join("crash/wer").join(label).join(queue);
+        let _ = status::run("正在复制应用日志", || {
+            logs::collect(output_dir, log);
+            Ok(())
+        });
+        let _ = status::run("正在查询事件日志", || {
+            for (channel, query) in [("Application", APPLICATION_QUERY), ("System", SYSTEM_QUERY)] {
+                let _ = log.report(
+                    "EVENTS",
+                    channel,
+                    collect_events(channel, query, output_dir),
+                );
+            }
+            Ok(())
+        });
+        let _ = status::run("正在收集崩溃报告", || {
+            for (variable, label) in [("LOCALAPPDATA", "user"), ("ProgramData", "machine")] {
+                if let Some(base) = std::env::var_os(variable) {
+                    for queue in ["ReportArchive", "ReportQueue"] {
+                        let source = Path::new(&base).join("Microsoft/Windows/WER").join(queue);
+                        let destination = output_dir.join("crash/wer").join(label).join(queue);
+                        let _ = log.report(
+                            "WER",
+                            source.display(),
+                            copy_reports(&source, &destination, log),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        });
+        let _ = status::run("正在收集崩溃转储", || {
+            for (variable, suffix, label) in [
+                ("LOCALAPPDATA", "CrashDumps", "user"),
+                (
+                    "SystemRoot",
+                    "System32/config/systemprofile/AppData/Local/CrashDumps",
+                    "system",
+                ),
+                (
+                    "SystemRoot",
+                    "ServiceProfiles/LocalService/AppData/Local/CrashDumps",
+                    "local-service",
+                ),
+                (
+                    "SystemRoot",
+                    "ServiceProfiles/NetworkService/AppData/Local/CrashDumps",
+                    "network-service",
+                ),
+            ] {
+                if let Some(base) = std::env::var_os(variable) {
+                    let source = Path::new(&base).join(suffix);
+                    let destination = output_dir.join("crash/dumps").join(label);
                     let _ = log.report(
-                        "WER",
+                        "CRASHDUMPS",
                         source.display(),
-                        copy_reports(&source, &destination, log),
+                        copy_dumps(&source, &destination, log),
                     );
                 }
             }
-        }
-
-        for (variable, suffix, label) in [
-            ("LOCALAPPDATA", "CrashDumps", "user"),
-            (
-                "SystemRoot",
-                "System32/config/systemprofile/AppData/Local/CrashDumps",
-                "system",
-            ),
-            (
-                "SystemRoot",
-                "ServiceProfiles/LocalService/AppData/Local/CrashDumps",
-                "local-service",
-            ),
-            (
-                "SystemRoot",
-                "ServiceProfiles/NetworkService/AppData/Local/CrashDumps",
-                "network-service",
-            ),
-        ] {
-            if let Some(base) = std::env::var_os(variable) {
-                let source = Path::new(&base).join(suffix);
-                let destination = output_dir.join("crash/dumps").join(label);
-                let _ = log.report(
-                    "CRASHDUMPS",
-                    source.display(),
-                    copy_dumps(&source, &destination, log),
-                );
-            }
-        }
+            Ok(())
+        });
     }
 
     fn collect_events(channel: &str, query: &str, output_dir: &Path) -> io::Result<()> {
