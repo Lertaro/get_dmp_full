@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::{self},
     path::{Path, PathBuf},
@@ -7,37 +7,79 @@ use std::{
 
 use error_log::ErrorLog;
 
-const UPLOAD_SITE: &str = "https://app.dashbeam.net/";
+const UPLOAD_SITE: &str = "https://app.dashbeam.net";
 
 fn main() {
-    let argument = std::env::args_os().nth(1);
-    if let Err(error) = run(argument.as_deref()) {
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if let Err(error) = run(&arguments) {
         eprintln!("{}", error_log::format_record("RUN", error));
     }
-    if argument.is_none() {
+    if arguments.is_empty() {
         pause();
     }
 }
 
-fn run(argument: Option<&OsStr>) -> io::Result<()> {
-    let root = std::env::current_exe()?.with_file_name("dump_file");
-    fs::create_dir_all(&root)?;
-    let output_dir = if argument.is_none() {
-        // Keep previous runs untouched and exclude their contents from this run's ZIP.
-        let session = format!(
-            "{}-{}",
-            error_log::local_timestamp()
-                .replace([':', '.'], "-")
-                .replace(' ', "_"),
-            std::process::id(),
-        );
-        let directory = root.join(session);
-        fs::create_dir(&directory)?;
-        directory
+/// A bare run collects and packages; `--zip <路径>` says where the bundle goes. Any other
+/// argument only prints the version, so a mistyped option never starts a capture.
+fn resolve(arguments: &[OsString]) -> io::Result<(Option<&OsStr>, Option<&Path>)> {
+    let mut other = None;
+    let mut zip = None;
+    let mut iterator = arguments.iter();
+    while let Some(argument) = iterator.next() {
+        if argument == "--zip" {
+            let path = iterator
+                .next()
+                .ok_or_else(|| io::Error::other("missing path after --zip"))?;
+            zip = Some(Path::new(path));
+        } else if other.is_none() {
+            other = Some(argument.as_os_str());
+        }
+    }
+    Ok((other, zip))
+}
+
+/// `--zip` may name a folder, which keeps the timestamped file name, or a file, which is used
+/// exactly as given.
+fn zip_destination(folder: &Path, session: &str) -> PathBuf {
+    if folder
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        folder.to_path_buf()
     } else {
-        root
+        folder.join(format!("{session}.zip"))
+    }
+}
+
+fn run(arguments: &[OsString]) -> io::Result<()> {
+    let (argument, zip_override) = resolve(arguments)?;
+    // The finished ZIP is the only deliverable of the program folder. A release build collects
+    // into %TEMP%; a debug build keeps the scratch session next to the working directory.
+    let zip_dir = std::env::current_exe()?.with_file_name("dump_file");
+    fs::create_dir_all(&zip_dir)?;
+    #[allow(unused_assignments)]
+    let mut work_root = PathBuf::new();
+    if cfg!(debug_assertions) {
+        work_root = std::env::current_dir()?.join("dump_file");
+    } else {
+        work_root = std::env::temp_dir().join(env!("CARGO_PKG_NAME"));
+    }
+    fs::create_dir_all(&work_root)?;
+    // Keep previous runs untouched and exclude their contents from this run's ZIP.
+    let session = format!(
+        "{}-{}",
+        error_log::local_timestamp()
+            .replace([':', '.'], "-")
+            .replace(' ', "_"),
+        std::process::id(),
+    );
+    let work_dir = if argument.is_none() {
+        work_root.join(&session)
+    } else {
+        zip_dir.clone()
     };
-    let log = ErrorLog::new(&output_dir)?;
+    fs::create_dir_all(&work_dir)?;
+    let log = ErrorLog::new(&work_dir)?;
 
     if let Some(argument) = argument {
         if matches!(
@@ -47,7 +89,7 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
             let _ = log.report(
                 "SOURCE",
                 "main.rs",
-                fs::write(output_dir.join("main.rs"), include_str!("main.rs")),
+                fs::write(work_dir.join("main.rs"), include_str!("main.rs")),
             );
         }
         println!(
@@ -57,17 +99,38 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
         return Ok(());
     }
 
-    // The dump question comes first, while the console is still idle: only a memory
-    // problem needs the heap, and everything else fits in a mini dump of ~3% the size.
+    // Only a collecting run has a bundle to place.
+    let zip_path = match zip_override {
+        Some(folder) => zip_destination(folder, &session),
+        None => zip_dir.join(format!("{session}.zip")),
+    };
+    if let Some(parent) = zip_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    prompt::ready();
+
+    // The reproduction has to survive reading the console, so the processes are frozen before
+    // anything is asked or collected and released as soon as the dumps have landed.
     let processes = status::run("正在检查 Lertaro 进程", processes::running);
+    let mut frozen = log.report(
+        "FREEZE",
+        "suspend",
+        status::run("正在冻结 Lertaro 进程", || {
+            freeze::suspend(processes.as_deref().unwrap_or_default(), &log)
+        }),
+    );
+    if let Some(frozen) = &frozen {
+        frozen.announce();
+    }
     let memory = matches!(&processes, Ok(list) if !list.is_empty())
         && prompt::confirm("本次问题是否与内存有关（越用越占内存、内存泄漏、内存暴涨）？");
 
     // Machine, permission and runtime details belong in every bundle, dump or no dump.
-    system::collect(&output_dir, &log);
+    system::collect(&work_dir, &log);
     // Logs and previously written crash artifacts describe the failure just as well while
     // the app is still running, so they are collected before the dump decision.
-    diagnostics::collect(&output_dir, &log);
+    diagnostics::collect(&work_dir, &log);
 
     // An unsuccessful query is not evidence that all target processes have stopped.
     let mut uncompressed = false;
@@ -78,21 +141,46 @@ fn run(argument: Option<&OsStr>) -> io::Result<()> {
             .report(
                 "DUMP",
                 "collect",
-                dump::collect(&output_dir, &processes, &log, memory),
+                dump::collect(&work_dir, &processes, &log, memory),
             )
             .unwrap_or_default();
+    }
+    // Frozen processes keep their locks, so Lertaro runs again while 7-Zip works.
+    if let Some(frozen) = &mut frozen
+        && frozen.has_processes()
+    {
+        let _ = log.report(
+            "FREEZE",
+            "resume",
+            status::run("正在恢复 Lertaro 进程", || frozen.resume()),
+        );
     }
     // An uncompressed full dump is raw memory, so archiving earns its keep. Mini dumps and
     // ProDump's own compressed dumps are already small, where deflating only costs time.
     let level = if uncompressed { "-mx=1" } else { "-mx=0" };
     let archived = status::run("正在压缩诊断文件", || {
-        archive::create(&output_dir, level)
+        archive::create(&work_dir, &zip_path, level)
     });
     if let Some(zip) = log.report("ZIP", "archive", archived) {
+        println!("抓取与打包已完成。");
         println!("诊断包已生成：{}", zip.display());
+        let _ = log.report("FOLDER", "explorer", open_folder(&zip));
         offer_transfer(&zip);
     }
     Ok(())
+}
+
+/// Opens the folder holding the ZIP so the user never has to reconstruct the path.
+fn open_folder(zip: &Path) -> io::Result<()> {
+    let folder = zip
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::other("the ZIP path has no parent folder"))?;
+    // Explorer reports failure for a folder it opened successfully, so its exit code is ignored.
+    std::process::Command::new("explorer.exe")
+        .arg(folder)
+        .spawn()
+        .map(|_| ())
 }
 
 fn offer_transfer(zip: &Path) {
@@ -125,7 +213,74 @@ fn environment_path(variable: &str) -> io::Result<PathBuf> {
 }
 
 mod prompt {
+    use std::ffi::c_void;
     use std::io::{self, Write};
+
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const ENABLE_LINE_INPUT: u32 = 0x0002;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(index: u32) -> *mut c_void;
+        fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut c_void, mode: u32) -> i32;
+        fn FlushConsoleInputBuffer(handle: *mut c_void) -> i32;
+        fn ReadConsoleW(
+            handle: *mut c_void,
+            buffer: *mut u16,
+            count: u32,
+            read: *mut u32,
+            pending: *mut c_void,
+        ) -> i32;
+    }
+
+    /// Waits until the reproduction is on screen, because a dump of a state the user has
+    /// already navigated away from cannot be taken again.
+    pub(super) fn ready() {
+        println!(
+            "你是否已准备完毕，当前复现了bug？\n\
+             如果是搜索相关的bug，请将复现问题的Lertaro窗口置顶（鼠标中键点击搜索框的Lertaro图标），然后按回车键进入下一步"
+        );
+        wait_key();
+    }
+
+    /// Takes one keypress without waiting for Enter or echoing it. A redirected console has no
+    /// console mode to relax, so it falls back to reading a line.
+    fn wait_key() {
+        let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut mode = 0;
+        if stdin.is_null()
+            || stdin == usize::MAX as *mut c_void
+            || unsafe { GetConsoleMode(stdin, &mut mode) } == 0
+        {
+            let _ = io::stdin().read_line(&mut String::new());
+            return;
+        }
+        // Keys typed while the instructions were printed must not skip the wait.
+        unsafe { FlushConsoleInputBuffer(stdin) };
+        if unsafe { SetConsoleMode(stdin, mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)) } == 0 {
+            let _ = io::stdin().read_line(&mut String::new());
+            return;
+        }
+        let mut buffer = [0u16; 8];
+        let mut read = 0;
+        // SAFETY: The buffer outlives the call and its length is passed with it; the last
+        // pointer is the documented optional OVERLAPPED parameter.
+        let arrived = unsafe {
+            ReadConsoleW(
+                stdin,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe { SetConsoleMode(stdin, mode) };
+        if arrived == 0 {
+            let _ = io::stdin().read_line(&mut String::new());
+        }
+    }
 
     /// Asks a yes/no question on the console. An unattended run gives no answer at all, so
     /// the default keeps it moving instead of blocking forever.
@@ -243,8 +398,8 @@ mod error_log {
     }
 
     impl ErrorLog {
-        pub(super) fn new(output_dir: &Path) -> io::Result<Self> {
-            let path = output_dir.join("run.log");
+        pub(super) fn new(work_dir: &Path) -> io::Result<Self> {
+            let path = work_dir.join("run.log");
             // A BOM lets Windows text editors recognize UTF-8 in any system locale.
             fs::write(&path, b"\xEF\xBB\xBF")?;
             Ok(Self { path })
@@ -486,43 +641,39 @@ mod command {
 }
 
 mod tools {
-    use std::{
-        fs, io,
-        path::{Path, PathBuf},
-    };
+    use std::{fs, io, path::PathBuf};
 
-    fn extract(output_dir: &Path, files: &[(&str, &[u8])]) -> io::Result<PathBuf> {
-        // Tools are siblings of dump_file, never part of its contents.
-        let directory = output_dir.with_file_name(".dump_tools");
+    /// Embedded helpers live under %TEMP%, away from the collected files, so nothing of the
+    /// tool set can end up inside the bundle and the program folder stays free of binaries.
+    fn directory() -> io::Result<PathBuf> {
+        let directory = std::env::temp_dir()
+            .join(env!("CARGO_PKG_NAME"))
+            .join(".dump_tools");
         fs::create_dir_all(&directory)?;
+        Ok(directory)
+    }
+
+    fn extract(files: &[(&str, &[u8])]) -> io::Result<PathBuf> {
+        let directory = directory()?;
         for (name, bytes) in files {
             fs::write(directory.join(name), bytes)?;
         }
         Ok(directory.join(files[0].0))
     }
 
-    pub(super) fn procdump(output_dir: &Path) -> io::Result<PathBuf> {
-        extract(
-            output_dir,
-            &[("procdump.exe", include_bytes!("../res/procdump.exe"))],
-        )
+    pub(super) fn procdump() -> io::Result<PathBuf> {
+        extract(&[("procdump.exe", include_bytes!("../res/procdump.exe"))])
     }
 
-    pub(super) fn fastfetch(output_dir: &Path) -> io::Result<PathBuf> {
-        extract(
-            output_dir,
-            &[("fastfetch.exe", include_bytes!("../res/fastfetch.exe"))],
-        )
+    pub(super) fn fastfetch() -> io::Result<PathBuf> {
+        extract(&[("fastfetch.exe", include_bytes!("../res/fastfetch.exe"))])
     }
 
-    pub(super) fn zip(output_dir: &Path) -> io::Result<PathBuf> {
-        extract(
-            output_dir,
-            &[
-                ("7z.exe", include_bytes!("../res/7z.exe")),
-                ("7z.dll", include_bytes!("../res/7z.dll")),
-            ],
-        )
+    pub(super) fn zip() -> io::Result<PathBuf> {
+        extract(&[
+            ("7z.exe", include_bytes!("../res/7z.exe")),
+            ("7z.dll", include_bytes!("../res/7z.dll")),
+        ])
     }
 }
 
@@ -581,6 +732,257 @@ mod processes {
     }
 }
 
+mod freeze {
+    use super::{ErrorLog, processes};
+    use std::ffi::c_void;
+    use std::io;
+
+    /// The single right `NtSuspendProcess` needs on the process handle.
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+    const TOKEN_QUERY: u32 = 0x0001;
+    const SE_PRIVILEGE_ENABLED: u32 = 0x0000_0002;
+
+    /// An ntdll routine that takes one process handle and answers with an NTSTATUS.
+    type NtProcess = unsafe extern "system" fn(*mut c_void) -> i32;
+
+    #[repr(C)]
+    struct Luid {
+        low: u32,
+        high: i32,
+    }
+
+    #[repr(C)]
+    struct LuidAndAttributes {
+        luid: Luid,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct TokenPrivileges {
+        count: u32,
+        privileges: [LuidAndAttributes; 1],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn AdjustTokenPrivileges(
+            token: *mut c_void,
+            disable_all: i32,
+            requested: *const TokenPrivileges,
+            length: u32,
+            previous: *mut TokenPrivileges,
+            returned: *mut u32,
+        ) -> i32;
+        fn GetModuleHandleW(module: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const i8) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut Luid) -> i32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// `NtSuspendProcess` and `NtResumeProcess` are exported by ntdll but not by any import
+    /// library the toolchain ships reliably, so they are looked up at run time. ntdll is mapped
+    /// into every process, so this needs no loading and leaves no module to free.
+    fn ntdll(entry: &str) -> io::Result<NtProcess> {
+        let module = unsafe { GetModuleHandleW(wide("ntdll.dll").as_ptr()) };
+        if module.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let name: Vec<i8> = entry.bytes().map(|byte| byte as i8).chain([0]).collect();
+        let address = unsafe { GetProcAddress(module, name.as_ptr()) };
+        if address.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetProcAddress returned a non-null address for an ntdll export whose
+        // signature is (HANDLE) -> NTSTATUS, and a function pointer is the same size as the
+        // returned address.
+        Ok(unsafe { std::mem::transmute::<*mut c_void, NtProcess>(address) })
+    }
+
+    /// One open handle per frozen process: `NtResumeProcess` is called through the very handle
+    /// that froze it, so a process another caller suspended cannot be released by mistake.
+    pub(super) struct Frozen {
+        handles: Vec<*mut c_void>,
+        targets: usize,
+        resume_process: NtProcess,
+        refused: Option<String>,
+    }
+
+    /// Freezes every target process so the reproduced state cannot drift while the console is
+    /// read and the dumps are written.
+    pub(super) fn suspend(list: &[processes::Process], log: &ErrorLog) -> io::Result<Frozen> {
+        let suspend_process = ntdll("NtSuspendProcess")?;
+        let resume_process = ntdll("NtResumeProcess")?;
+        let targets = list.len();
+        if list.is_empty() {
+            return Ok(Frozen {
+                handles: Vec::new(),
+                targets,
+                resume_process,
+                refused: None,
+            });
+        }
+        enable_debug_privilege(log);
+        let mut handles = Vec::new();
+        let mut refused = None;
+        for process in list {
+            // One call freezes the whole process, including threads created after this point.
+            let handle = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, process.pid) };
+            let failure = if handle.is_null() {
+                Some(format!(
+                    "OpenProcess failed: {}",
+                    io::Error::last_os_error()
+                ))
+            } else {
+                let status = unsafe { suspend_process(handle) };
+                if status == 0 {
+                    handles.push(handle);
+                    None
+                } else {
+                    unsafe { CloseHandle(handle) };
+                    Some(format!("NtSuspendProcess failed: {status:#010x}"))
+                }
+            };
+            if let Some(failure) = failure {
+                log.error("FREEZE", process, &failure);
+                refused = refused.or(Some(failure));
+            }
+        }
+        Ok(Frozen {
+            handles,
+            targets,
+            resume_process,
+            refused,
+        })
+    }
+
+    impl Frozen {
+        pub(super) fn has_processes(&self) -> bool {
+            !self.handles.is_empty()
+        }
+
+        /// Tells the user what stopped, because a frozen window looks exactly like a hung one.
+        /// The reason is the one the system actually gave, never a guess.
+        pub(super) fn announce(&self) {
+            if self.targets == 0 {
+                println!("没有正在运行的 Lertaro 进程，跳过冻结。");
+            } else if self.handles.is_empty() {
+                println!(
+                    "未能冻结任何进程（{}），转储可能抓不到复现瞬间的状态。",
+                    self.refused.as_deref().unwrap_or("原因见 run.log")
+                );
+            } else {
+                println!("已冻结 {} 个进程。", self.handles.len());
+                if self.handles.len() < self.targets {
+                    println!(
+                        "另有 {} 个进程没能冻结（{}）。",
+                        self.targets - self.handles.len(),
+                        self.refused.as_deref().unwrap_or("原因见 run.log")
+                    );
+                }
+            }
+        }
+
+        /// Releases every process this run froze and reports the first refusal.
+        pub(super) fn resume(&mut self) -> io::Result<()> {
+            let mut refused = None;
+            for handle in std::mem::take(&mut self.handles) {
+                let status = unsafe { (self.resume_process)(handle) };
+                if status != 0 && refused.is_none() {
+                    refused = Some(io::Error::other(format!(
+                        "NtResumeProcess failed: {status:#010x}"
+                    )));
+                }
+                unsafe { CloseHandle(handle) };
+            }
+            match refused {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            // A failed dump or archive must not leave Lertaro frozen.
+            let _ = self.resume();
+        }
+    }
+
+    /// Opens the door to the session 0 service process, whose handle an elevated token may only
+    /// open with the debug privilege — held by default, but disabled.
+    fn enable_debug_privilege(log: &ErrorLog) {
+        let name = wide("SeDebugPrivilege");
+        let mut luid = Luid { low: 0, high: 0 };
+        if unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) } == 0 {
+            log.error(
+                "FREEZE",
+                "LookupPrivilegeValueW",
+                io::Error::last_os_error(),
+            );
+            return;
+        }
+        let mut token = std::ptr::null_mut();
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            )
+        } == 0
+        {
+            log.error("FREEZE", "OpenProcessToken", io::Error::last_os_error());
+            return;
+        }
+        let requested = TokenPrivileges {
+            count: 1,
+            privileges: [LuidAndAttributes {
+                luid,
+                attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let assigned = unsafe {
+            AdjustTokenPrivileges(
+                token,
+                0,
+                &requested,
+                std::mem::size_of::<TokenPrivileges>() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        // A token that does not hold the privilege reports ERROR_NOT_ALL_ASSIGNED here rather
+        // than failing the call, so read it before any other API can overwrite it.
+        let code = unsafe { GetLastError() };
+        unsafe { CloseHandle(token) };
+        if assigned == 0 {
+            log.error(
+                "FREEZE",
+                "AdjustTokenPrivileges",
+                io::Error::from_raw_os_error(code as i32),
+            );
+        } else if code != 0 {
+            log.error(
+                "FREEZE",
+                "SeDebugPrivilege",
+                io::Error::from_raw_os_error(code as i32),
+            );
+        }
+    }
+}
+
 mod dump {
     use super::{ErrorLog, command, processes, status, tools};
     use std::{
@@ -595,16 +997,16 @@ mod dump {
 
     /// Collects every target process, answering whether an uncompressed full dump landed.
     pub(super) fn collect(
-        output_dir: &Path,
+        work_dir: &Path,
         processes: &[processes::Process],
         log: &ErrorLog,
         memory: bool,
     ) -> io::Result<bool> {
-        let executable = tools::procdump(output_dir)?;
+        let executable = tools::procdump()?;
         let mut uncompressed = false;
         for process in processes {
             let landed = status::run(&format!("正在转储 {process}"), || {
-                create(&executable, output_dir, process, log, memory)
+                create(&executable, work_dir, process, log, memory)
             });
             if log.report("DUMP", process, landed).unwrap_or_default() {
                 uncompressed = true;
@@ -615,7 +1017,7 @@ mod dump {
 
     fn create(
         executable: &Path,
-        output_dir: &Path,
+        work_dir: &Path,
         process: &processes::Process,
         log: &ErrorLog,
         memory: bool,
@@ -623,15 +1025,15 @@ mod dump {
         // Stacks, metadata and what the stacks reference are enough for crashes, hangs and
         // startup failures, and that is roughly 3% of a full dump.
         if !memory {
-            return capture(executable, output_dir, process, MINI).map(|()| false);
+            return capture(executable, work_dir, process, MINI).map(|()| false);
         }
         // Some Windows builds refuse ProDump's compressed full dump outright. Falling back
         // costs a larger file, which is still better than shipping a bundle without a dump.
-        match capture(executable, output_dir, process, COMPRESSED) {
+        match capture(executable, work_dir, process, COMPRESSED) {
             Err(error) if error.to_string().contains("Error writing dump file") => {
                 // Record the refusal so the reader learns this machine cannot compress.
                 log.error("DUMP", process, format!("compressed dump refused: {error}"));
-                capture(executable, output_dir, process, UNCOMPRESSED).map(|()| true)
+                capture(executable, work_dir, process, UNCOMPRESSED).map(|()| true)
             }
             result => result.map(|()| false),
         }
@@ -639,7 +1041,7 @@ mod dump {
 
     fn capture(
         executable: &Path,
-        output_dir: &Path,
+        work_dir: &Path,
         process: &processes::Process,
         dump_type: &str,
     ) -> io::Result<()> {
@@ -651,7 +1053,7 @@ mod dump {
                 &process.pid.to_string(),
                 "PROCESSNAME_PID.dmp",
             ])
-            .current_dir(output_dir)
+            .current_dir(work_dir)
             .output()?;
         check(output, command::console_code_page())
     }
@@ -682,13 +1084,13 @@ mod logs {
         ),
     ];
 
-    pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
+    pub(super) fn collect(work_dir: &Path, log: &ErrorLog) {
         for (variable, relative_source, relative_destination) in SOURCES {
             let Some(base) = log.report("LOGS", variable, environment_path(variable)) else {
                 continue;
             };
             let source = base.join(relative_source);
-            let destination = output_dir.join(relative_destination);
+            let destination = work_dir.join(relative_destination);
             let _ = log.report(
                 "LOGS",
                 source.display(),
@@ -776,43 +1178,43 @@ mod system {
     ];
     const DOTNET_MAJORS: [u32; 4] = [7, 8, 9, 10];
 
-    pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
+    pub(super) fn collect(work_dir: &Path, log: &ErrorLog) {
         let _ = log.report(
             "SYSTEM",
             "fastfetch.txt",
-            status::run("正在采集系统信息", || fastfetch(output_dir)),
+            status::run("正在采集系统信息", || fastfetch(work_dir)),
         );
         let _ = log.report(
             "SYSTEM",
             "icacls.txt",
-            status::run("正在读取目录权限", || permissions(output_dir, log)),
+            status::run("正在读取目录权限", || permissions(work_dir, log)),
         );
         let _ = log.report(
             "SYSTEM",
             "account.txt",
-            status::run("正在检查账户权限", || account(output_dir, log)),
+            status::run("正在检查账户权限", || account(work_dir, log)),
         );
         let _ = log.report(
             "SYSTEM",
             "dotnet.txt",
-            status::run("正在检查 .NET 环境", || dotnet(output_dir, log)),
+            status::run("正在检查 .NET 环境", || dotnet(work_dir, log)),
         );
     }
 
-    fn write_report(output_dir: &Path, name: &str, text: &str) -> io::Result<()> {
-        let directory = output_dir.join("system");
+    fn write_report(work_dir: &Path, name: &str, text: &str) -> io::Result<()> {
+        let directory = work_dir.join("system");
         fs::create_dir_all(&directory)?;
         // A BOM lets Windows text editors recognize UTF-8 in any system locale.
         fs::write(directory.join(name), format!("\u{feff}{text}"))
     }
 
-    fn fastfetch(output_dir: &Path) -> io::Result<()> {
+    fn fastfetch(work_dir: &Path) -> io::Result<()> {
         // --logo None keeps the report plain text instead of ASCII art.
-        let text = command::text_utf8(tools::fastfetch(output_dir)?, &["--logo", "None"])?;
-        write_report(output_dir, "fastfetch.txt", &text)
+        let text = command::text_utf8(tools::fastfetch()?, &["--logo", "None"])?;
+        write_report(work_dir, "fastfetch.txt", &text)
     }
 
-    fn permissions(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
+    fn permissions(work_dir: &Path, log: &ErrorLog) -> io::Result<()> {
         let mut targets: Vec<(&'static str, PathBuf)> = Vec::new();
         for (label, path) in install_dirs(log) {
             push(&mut targets, label, path);
@@ -839,7 +1241,7 @@ mod system {
         if targets.is_empty() {
             text.push_str("(no directory to inspect)\r\n");
         }
-        write_report(output_dir, "icacls.txt", &text)
+        write_report(work_dir, "icacls.txt", &text)
     }
 
     fn describe(path: &Path) -> io::Result<String> {
@@ -854,7 +1256,7 @@ mod system {
         Ok(text)
     }
 
-    fn account(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
+    fn account(work_dir: &Path, log: &ErrorLog) -> io::Result<()> {
         let mut text = String::new();
         let mut groups = String::new();
         for argument in ["/user", "/groups", "/priv"] {
@@ -891,7 +1293,7 @@ mod system {
             yes_no(admin),
             yes_no(integrity.starts_with("High")),
         ));
-        write_report(output_dir, "account.txt", &text)
+        write_report(work_dir, "account.txt", &text)
     }
 
     fn yes_no(value: bool) -> &'static str {
@@ -913,7 +1315,7 @@ mod system {
         format!("{level} ({sid})")
     }
 
-    fn dotnet(output_dir: &Path, log: &ErrorLog) -> io::Result<()> {
+    fn dotnet(work_dir: &Path, log: &ErrorLog) -> io::Result<()> {
         let mut text = String::new();
         let mut release = None;
         let mut installed = false;
@@ -995,7 +1397,7 @@ mod system {
             ));
         }
 
-        write_report(output_dir, "dotnet.txt", &text)
+        write_report(work_dir, "dotnet.txt", &text)
     }
 
     fn installed_versions(directory: &Path) -> io::Result<Vec<String>> {
@@ -1161,18 +1563,14 @@ mod diagnostics {
     pub(super) const APPLICATION_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and ((Provider[@Name='Application Error'] and EventID=1000) or (Provider[@Name='.NET Runtime'] and EventID=1026) or (Provider[@Name='Windows Error Reporting'] and EventID=1001))]]";
     pub(super) const SYSTEM_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and Provider[@Name='Service Control Manager'] and (EventID=7000 or EventID=7001 or EventID=7009 or EventID=7011 or EventID=7022 or EventID=7023 or EventID=7024 or EventID=7031 or EventID=7034)]]";
 
-    pub(super) fn collect(output_dir: &Path, log: &ErrorLog) {
+    pub(super) fn collect(work_dir: &Path, log: &ErrorLog) {
         let _ = status::run("正在复制应用日志", || {
-            logs::collect(output_dir, log);
+            logs::collect(work_dir, log);
             Ok(())
         });
         let _ = status::run("正在查询事件日志", || {
             for (channel, query) in [("Application", APPLICATION_QUERY), ("System", SYSTEM_QUERY)] {
-                let _ = log.report(
-                    "EVENTS",
-                    channel,
-                    collect_events(channel, query, output_dir),
-                );
+                let _ = log.report("EVENTS", channel, collect_events(channel, query, work_dir));
             }
             Ok(())
         });
@@ -1183,7 +1581,7 @@ mod diagnostics {
                 };
                 for queue in ["ReportArchive", "ReportQueue"] {
                     let source = base.join("Microsoft/Windows/WER").join(queue);
-                    let destination = output_dir.join("crash/wer").join(label).join(queue);
+                    let destination = work_dir.join("crash/wer").join(label).join(queue);
                     let _ = log.report(
                         "WER",
                         source.display(),
@@ -1217,7 +1615,7 @@ mod diagnostics {
                     continue;
                 };
                 let source = base.join(suffix);
-                let destination = output_dir.join("crash/dumps").join(label);
+                let destination = work_dir.join("crash/dumps").join(label);
                 let _ = log.report(
                     "CRASHDUMPS",
                     source.display(),
@@ -1228,7 +1626,7 @@ mod diagnostics {
         });
     }
 
-    fn collect_events(channel: &str, query: &str, output_dir: &Path) -> io::Result<()> {
+    fn collect_events(channel: &str, query: &str, work_dir: &Path) -> io::Result<()> {
         let filter = format!("/q:{query}");
         let events = filter_events(&command::text(
             "wevtutil.exe",
@@ -1243,7 +1641,7 @@ mod diagnostics {
             ],
         )?);
         if !events.is_empty() {
-            let directory = output_dir.join("crash/events");
+            let directory = work_dir.join("crash/events");
             fs::create_dir_all(&directory)?;
             fs::write(
                 directory.join(format!("{channel}.xml")),
@@ -1389,10 +1787,10 @@ mod archive {
         process::Command,
     };
 
-    pub(super) fn create(output_dir: &Path, level: &str) -> io::Result<PathBuf> {
-        let executable = tools::zip(output_dir)?;
-        let destination = output_dir.with_extension("zip");
-        let pending = output_dir.with_extension("pending.zip");
+    pub(super) fn create(work_dir: &Path, destination: &Path, level: &str) -> io::Result<PathBuf> {
+        let executable = tools::zip()?;
+        // Written beside the working directory: 7-Zip must not archive its own output.
+        let pending = work_dir.with_extension("pending.zip");
         if pending.try_exists()? {
             fs::remove_file(&pending)?;
         }
@@ -1410,19 +1808,18 @@ mod archive {
                     "-sse",
                     "-ssw",
                 ])
-                .args([
-                    "-xr!procdump*.exe",
-                    "-xr!7z.exe",
-                    "-xr!7z.dll",
-                    "-xr!.dump_tools",
-                ])
                 .arg(&pending)
                 .arg(".")
-                .current_dir(output_dir),
+                .current_dir(work_dir),
             command::UTF8,
         )?;
         // Replace only after 7-Zip completed without warnings or errors.
-        fs::rename(&pending, &destination)?;
-        Ok(destination)
+        if fs::rename(&pending, destination).is_err() {
+            // %TEMP% and the program folder can sit on different volumes, where a rename has no
+            // choice but to copy.
+            fs::copy(&pending, destination)?;
+            fs::remove_file(&pending)?;
+        }
+        Ok(destination.to_path_buf())
     }
 }
