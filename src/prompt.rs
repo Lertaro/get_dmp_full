@@ -49,6 +49,16 @@ pub(crate) fn memory() -> bool {
     )
 }
 
+/// Warns before a full dump, which reads every page of the process and stalls the machine for
+/// minutes. The mini dump path never sees this dialog: it takes a second and stutters nothing.
+///
+/// Both full-dump types are covered because the compressed one is what is attempted first; a
+/// machine that refuses it falls back to the uncompressed one, which stalls the machine just as
+/// hard. The refusal is only known once the capture has already started.
+pub(crate) fn full_dump_warning() {
+    warn_msgbox(t("prompt.full_dump.body"), t("prompt.full_dump.title"), 0);
+}
+
 pub(crate) fn upload(zip: &Path) -> bool {
     ask(
         Buttons::YesNo,

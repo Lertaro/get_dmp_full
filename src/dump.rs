@@ -9,7 +9,6 @@ use crate::i18n::tr;
 use crate::processes;
 use crate::{command, status, tools};
 
-const COMPRESSED: &str = "-mac";
 const UNCOMPRESSED: &str = "-ma";
 const MINI: &str = "-mm";
 
@@ -21,48 +20,26 @@ pub(crate) fn collect(
     memory: bool,
 ) -> io::Result<bool> {
     let executable = tools::procdump()?;
+    let dump_type = dump_type(memory);
     let mut uncompressed = false;
     for process in processes {
         let label = tr("status.dump", &[("process", &process)]);
         let landed = status::run(&label, || {
-            create(&executable, work_dir, process, log, memory)
+            capture(&executable, work_dir, process, dump_type)
         });
-        if log.report("DUMP", process, landed).unwrap_or_default() {
+        if memory && log.report("DUMP", process, landed).is_some() {
             uncompressed = true;
         }
     }
     Ok(uncompressed)
 }
 
-fn create(
-    executable: &Path,
-    work_dir: &Path,
-    process: &processes::Process,
-    log: &ErrorLog,
-    memory: bool,
-) -> io::Result<bool> {
-    // Stacks, metadata and what the stacks reference are enough for crashes, hangs and
-    // startup failures, and that is roughly 3% of a full dump.
-    if !memory {
-        return capture(executable, work_dir, process, MINI).map(|()| false);
-    }
-    // Some Windows builds refuse ProDump's compressed full dump outright. Falling back
-    // costs a larger file, which is still better than shipping a bundle without a dump.
-    match capture(executable, work_dir, process, COMPRESSED) {
-        Err(error) if is_write_refusal(&error) => {
-            // Record the refusal so the reader learns this machine cannot compress.
-            log.error("DUMP", process, format!("compressed dump refused: {error}"));
-            capture(executable, work_dir, process, UNCOMPRESSED).map(|()| true)
-        }
-        result => result.map(|()| false),
-    }
-}
-
-/// Whether ProDump failed because the system refused the dump file rather than because it never
-/// reached the process. Only a refused write can be cured by dropping the compression, so
-/// `Error opening` (no permission, no such process) is never retried.
-fn is_write_refusal(error: &io::Error) -> bool {
-    error.to_string().contains("Error writing dump file")
+/// Stacks, metadata and what the stacks reference are enough for crashes, hangs and startup
+/// failures, and that is roughly 3% of a full dump. Only `-ma` carries a heap, and `-mac` is not
+/// attempted: it reads the same memory, some machines refuse it outright, so trying it first
+/// would only spend a failed pass before the capture that works.
+fn dump_type(memory: bool) -> &'static str {
+    if memory { UNCOMPRESSED } else { MINI }
 }
 
 fn capture(
@@ -101,18 +78,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_refused_dump_file_is_worth_retrying_uncompressed() {
-        let refused = io::Error::other("ProcDump: Error writing dump file: 0x80070057");
-        assert!(is_write_refusal(&refused));
-    }
-
-    #[test]
-    fn a_process_that_was_never_reached_is_not_retried() {
-        for reason in [
-            "ProcDump: Error opening executable: file not found -系统找不到指定的文件。 (2)",
-            "ProcDump: Error opening process",
-        ] {
-            assert!(!is_write_refusal(&io::Error::other(reason)), "{reason}");
-        }
+    fn only_a_memory_question_answered_yes_writes_a_full_dump() {
+        assert_eq!(dump_type(true), UNCOMPRESSED);
+        assert_eq!(dump_type(false), MINI);
     }
 }

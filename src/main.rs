@@ -51,7 +51,7 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     // The finished ZIP is the only deliverable of the program folder. A release build collects
     // into %TEMP%; a debug build keeps the scratch session next to the working directory.
     let work_root = if cfg!(debug_assertions) {
-        std::env::current_dir()?.join("dump_file")
+        std::env::current_dir()?
     } else {
         std::env::temp_dir().join(env!("CARGO_PKG_NAME"))
     };
@@ -110,6 +110,9 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     if let Some(processes) = log.report("PROCESSES", "query", processes)
         && !processes.is_empty()
     {
+        if memory {
+            prompt::full_dump_warning();
+        }
         uncompressed = log
             .report(
                 "DUMP",
@@ -128,8 +131,8 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
             status::run(t("status.resume"), || frozen.resume()),
         );
     }
-    // An uncompressed full dump is raw memory, so archiving earns its keep. Mini dumps and
-    // ProDump's own compressed dumps are already small, where deflating only costs time.
+    // A full dump is raw memory, so deflating earns its keep. Mini dumps are already small,
+    // where compressing only costs time.
     let level = if uncompressed { "-mx=1" } else { "-mx=0" };
     let archived = status::run(t("status.archive"), || {
         archive::create(&work_dir, &zip_path, level)

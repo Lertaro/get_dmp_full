@@ -233,8 +233,14 @@ const ZH_ENTRIES: &[(Key, &str)] = &[
     ("prompt.memory.title", "Lertaro 诊断 · 转储类型"),
     (
         "prompt.memory.body",
-        "本次问题是否与内存有关（越用越占内存、内存泄漏、内存暴涨）？\n\
+        "本次问题是否与内存有关（排序条目有误、卡住、占用暴涨、图标资源故障）？\n\
          选“是”抓取包含堆内存的完整转储，包体积大约大一个数量级；选“否”只抓迷你转储。",
+    ),
+    ("prompt.full_dump.title", "Lertaro 诊断 · 即将抓取完整转储"),
+    (
+        "prompt.full_dump.body",
+        "接下来抓取的是包含堆内存的完整转储。\n\
+         抓取过程中电脑可能卡顿 3-5 分钟，请耐心等待，期间尽量不要操作鼠标和键盘。",
     ),
     ("prompt.upload.title", "Lertaro 诊断 · 上传引导"),
     (
@@ -319,9 +325,19 @@ const EN_ENTRIES: &[(Key, &str)] = &[
     ("prompt.memory.title", "Lertaro Diagnostics · Dump type"),
     (
         "prompt.memory.body",
-        "Is this problem memory related (growing usage, a leak, a spike)?\n\
+        "Is this problem memory related (Sorting entries are wrong, Freezing, High resource usage, Icon failure)?\n\
          Yes captures a full dump including the heap, roughly an order of magnitude larger; \
          No captures a mini dump.",
+    ),
+    (
+        "prompt.full_dump.title",
+        "Lertaro Diagnostics · Full dump next",
+    ),
+    (
+        "prompt.full_dump.body",
+        "The next capture is a full dump including the heap.\n\
+         The computer may stutter for 3-5 minutes while it runs. Please wait, and leave the \
+         mouse and keyboard alone meanwhile.",
     ),
     ("prompt.upload.title", "Lertaro Diagnostics · Upload"),
     (
