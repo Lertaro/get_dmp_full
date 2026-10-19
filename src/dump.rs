@@ -49,13 +49,20 @@ fn create(
     // Some Windows builds refuse ProDump's compressed full dump outright. Falling back
     // costs a larger file, which is still better than shipping a bundle without a dump.
     match capture(executable, work_dir, process, COMPRESSED) {
-        Err(error) if error.to_string().contains("Error writing dump file") => {
+        Err(error) if is_write_refusal(&error) => {
             // Record the refusal so the reader learns this machine cannot compress.
             log.error("DUMP", process, format!("compressed dump refused: {error}"));
             capture(executable, work_dir, process, UNCOMPRESSED).map(|()| true)
         }
         result => result.map(|()| false),
     }
+}
+
+/// Whether ProDump failed because the system refused the dump file rather than because it never
+/// reached the process. Only a refused write can be cured by dropping the compression, so
+/// `Error opening` (no permission, no such process) is never retried.
+fn is_write_refusal(error: &io::Error) -> bool {
+    error.to_string().contains("Error writing dump file")
 }
 
 fn capture(
@@ -77,7 +84,7 @@ fn capture(
     check(output, command::console_code_page())
 }
 
-pub(crate) fn check(output: Output, code_page: u32) -> io::Result<()> {
+fn check(output: Output, code_page: u32) -> io::Result<()> {
     // ProcDump 12.01 returns -2 after reaching the requested dump count.
     // Require confirmation that the dump was written, not just that monitoring ended.
     if output.status.code() == Some(-2) {
@@ -87,4 +94,25 @@ pub(crate) fn check(output: Output, code_page: u32) -> io::Result<()> {
         }
     }
     command::check(output, code_page).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_dump_file_is_worth_retrying_uncompressed() {
+        let refused = io::Error::other("ProcDump: Error writing dump file: 0x80070057");
+        assert!(is_write_refusal(&refused));
+    }
+
+    #[test]
+    fn a_process_that_was_never_reached_is_not_retried() {
+        for reason in [
+            "ProcDump: Error opening executable: file not found -系统找不到指定的文件。 (2)",
+            "ProcDump: Error opening process",
+        ] {
+            assert!(!is_write_refusal(&io::Error::other(reason)), "{reason}");
+        }
+    }
 }

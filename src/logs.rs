@@ -1,6 +1,5 @@
 use std::{fs, io, path::Path};
 
-use crate::environment_path;
 use crate::error_log::ErrorLog;
 
 const SOURCES: [(&str, &str, &str); 2] = [
@@ -14,7 +13,7 @@ const SOURCES: [(&str, &str, &str); 2] = [
 
 pub(crate) fn collect(work_dir: &Path, log: &ErrorLog) {
     for (variable, relative_source, relative_destination) in SOURCES {
-        let Some(base) = log.report("LOGS", variable, environment_path(variable)) else {
+        let Some(base) = log.environment_path("LOGS", variable) else {
             continue;
         };
         let source = base.join(relative_source);

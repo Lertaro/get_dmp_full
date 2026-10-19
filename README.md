@@ -163,7 +163,7 @@ Version: 0.1.1
 - .NET Framework：读 `HKLM\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full` 与 `v4\Client` 的 `Install`/`Release`/`Version`，按微软公布的 Release 阈值推断已装版本，并逐项给出 `4`、`4.5`、`4.8` 是否存在（阈值推断只说明“至少是这个版本”）
 - .NET 7/8/9/10：扫描 `%ProgramFiles%\dotnet`（x64）与 `%ProgramFiles(x86)%\dotnet`（x86）下 `shared\Microsoft.NETCore.App`（运行时）、`shared\Microsoft.WindowsDesktop.App`（WPF 依赖的桌面运行时）、`sdk` 三类版本目录，列出实际版本号并按主版本给出 `7`/`8`/`9`/`10` 清单
 - 这一项只记录注册表值与目录名，不读取这些安装目录内的任何文件内容
-- 占位写法：注册表键或 `dotnet` 目录不存在记 `(absent)`，某类组件没有版本目录记 `(none)`，主版本清单里没有对应版本记 `not installed`
+- 占位写法：注册表键或 `dotnet` 目录不存在记 `(absent)`，目录存在但读不了记 `(unreadable)`（原因同时写进 `run.log`，不会因此丢掉整份报告），某类组件没有版本目录记 `(none)`，主版本清单里没有对应版本记 `not installed`
 
 ### 5. 日志文件（只读复制，不移动、不删除、不修改源文件）
 

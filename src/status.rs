@@ -19,6 +19,15 @@ pub(crate) fn run<T>(label: &str, work: impl FnOnce() -> io::Result<T>) -> io::R
     result
 }
 
+/// A step that reports its own failures through the log and so cannot fail as a whole, but
+/// still owes the console a ticking line.
+pub(crate) fn step(label: &str, work: impl FnOnce()) {
+    let _ = run(label, || {
+        work();
+        Ok(())
+    });
+}
+
 struct Stage {
     label: String,
     started: Instant,

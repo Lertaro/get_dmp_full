@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::environment_path;
 use crate::error_log::ErrorLog;
 use crate::i18n::t;
 use crate::{command, status, tools};
@@ -48,6 +47,10 @@ const FRAMEWORK_RELEASES: [(&str, u32); 11] = [
     ("4.8", 528_040),
     ("4.8.1", 533_320),
 ];
+
+// The versions the report calls out by name. Their thresholds come from FRAMEWORK_RELEASES,
+// so no Release number is written down twice.
+const FRAMEWORK_CHECKLIST: [&str; 2] = ["4.5", "4.8"];
 
 const DOTNET_COMPONENTS: [&str; 3] = [
     "shared/Microsoft.NETCore.App",
@@ -101,7 +104,7 @@ fn permissions(work_dir: &Path, log: &ErrorLog) -> io::Result<()> {
         ("config-user", "LOCALAPPDATA"),
         ("config-machine", "ProgramData"),
     ] {
-        let Some(base) = log.report("PERMS", variable, environment_path(variable)) else {
+        let Some(base) = log.environment_path("PERMS", variable) else {
             continue;
         };
         push(&mut targets, label, base.join("Lertaro"));
@@ -217,11 +220,11 @@ fn dotnet(work_dir: &Path, log: &ErrorLog) -> io::Result<()> {
     }
     text.push_str("\r\n[framework checklist]\r\n");
     text.push_str(&format!("4: {}\r\n", yes_no(installed)));
-    for (label, minimum) in [("4.5", 378_389), ("4.8", 528_040)] {
+    for label in FRAMEWORK_CHECKLIST {
         text.push_str(&format!(
             "{label}: {}\r\n",
             match release {
-                Some(value) => yes_no(value >= minimum),
+                Some(value) => yes_no(release_at_least(value, label)),
                 None => "unknown",
             }
         ));
@@ -233,26 +236,41 @@ fn dotnet(work_dir: &Path, log: &ErrorLog) -> io::Result<()> {
     text.push_str("\r\n[.NET runtime and SDK]\r\n");
     let mut versions: Vec<(&'static str, &'static str, String)> = Vec::new();
     for (label, variable) in [("x64", "ProgramFiles"), ("x86", "ProgramFiles(x86)")] {
-        let Some(base) = log.report("DOTNET", variable, environment_path(variable)) else {
+        let Some(base) = log.environment_path("DOTNET", variable) else {
             continue;
         };
         let root = base.join("dotnet");
-        if !root.try_exists()? {
+        // One unreadable folder is written into the report and skipped; aborting here would
+        // throw away the runtimes that were already listed.
+        let exists = match root.try_exists() {
+            Ok(exists) => exists,
+            Err(error) => {
+                log.error("DOTNET", root.display(), error);
+                text.push_str(&format!("{} ({label}) = (unreadable)\r\n", root.display()));
+                continue;
+            }
+        };
+        if !exists {
             text.push_str(&format!("{} ({label}) = (absent)\r\n", root.display()));
             continue;
         }
         text.push_str(&format!("{} ({label})\r\n", root.display()));
         for component in DOTNET_COMPONENTS {
-            let found = installed_versions(&root.join(component))?;
-            text.push_str(&format!(
-                "    {component}: {}\r\n",
-                if found.is_empty() {
-                    String::from("(none)")
-                } else {
-                    found.join(", ")
+            let path = root.join(component);
+            match log.report("DOTNET", path.display(), installed_versions(&path)) {
+                Some(found) => {
+                    text.push_str(&format!(
+                        "    {component}: {}\r\n",
+                        if found.is_empty() {
+                            String::from("(none)")
+                        } else {
+                            found.join(", ")
+                        }
+                    ));
+                    versions.extend(found.into_iter().map(|version| (label, component, version)));
                 }
-            ));
-            versions.extend(found.into_iter().map(|version| (label, component, version)));
+                None => text.push_str(&format!("    {component}: (unreadable)\r\n")),
+            }
         }
     }
     text.push_str("\r\n[dotnet checklist]\r\n");
@@ -318,6 +336,15 @@ fn framework_name(release: u32) -> &'static str {
         }
     }
     name
+}
+
+/// Whether a Release value means the named version is present. 4.x is cumulative, so this is
+/// the same walk `framework_name` does, stopped at one label.
+fn release_at_least(release: u32, label: &str) -> bool {
+    FRAMEWORK_RELEASES
+        .iter()
+        .find(|(name, _)| *name == label)
+        .is_some_and(|(_, minimum)| release >= *minimum)
 }
 
 fn install_dirs(log: &ErrorLog) -> Vec<(&'static str, PathBuf)> {
@@ -430,4 +457,42 @@ fn push(targets: &mut Vec<(&'static str, PathBuf)>, label: &'static str, path: P
         return;
     }
     targets.push((label, PathBuf::from(text)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checklist_labels_have_thresholds_in_the_shared_table() {
+        for label in FRAMEWORK_CHECKLIST {
+            assert!(
+                FRAMEWORK_RELEASES.iter().any(|(name, _)| *name == label),
+                "{label} has no Release threshold to compare against"
+            );
+        }
+    }
+
+    #[test]
+    fn framework_release_thresholds_are_cumulative() {
+        assert!(release_at_least(533_320, "4.5"));
+        assert!(release_at_least(533_320, "4.8"));
+        assert!(release_at_least(394_802, "4.5"));
+        assert!(!release_at_least(394_802, "4.8"));
+        assert_eq!(framework_name(394_802), "4.6.2");
+        assert_eq!(framework_name(1), "4.0");
+    }
+
+    #[test]
+    fn dotnet_version_names_sort_and_split_by_major() {
+        assert!(version_key("8.0.2") < version_key("8.0.10"));
+        assert_eq!(version_major("10.0.0-preview.1"), Some(10));
+        assert_eq!(version_major(""), None);
+    }
+
+    #[test]
+    fn registry_release_values_are_hex_with_their_prefix() {
+        assert_eq!(parse_release("0x80231"), Some(524_849));
+        assert_eq!(parse_release("533320"), None);
+    }
 }

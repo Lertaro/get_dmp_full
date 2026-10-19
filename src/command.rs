@@ -131,7 +131,7 @@ pub(crate) fn console_code_page() -> u32 {
     }
 }
 
-pub(crate) fn decode_code_page(bytes: &[u8], code_page: u32) -> String {
+fn decode_code_page(bytes: &[u8], code_page: u32) -> String {
     if bytes.is_empty() {
         return String::new();
     }

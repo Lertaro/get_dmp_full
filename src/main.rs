@@ -50,8 +50,6 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
 
     // The finished ZIP is the only deliverable of the program folder. A release build collects
     // into %TEMP%; a debug build keeps the scratch session next to the working directory.
-    let zip_dir = std::env::current_exe()?.with_file_name("dump_file");
-    fs::create_dir_all(&zip_dir)?;
     let work_root = if cfg!(debug_assertions) {
         std::env::current_dir()?.join("dump_file")
     } else {
@@ -70,12 +68,19 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     fs::create_dir_all(&work_dir)?;
     let log = ErrorLog::new(&work_dir)?;
 
-    // Only a collecting run has a bundle to place.
+    // The bundle belongs next to the program unless --zip said otherwise. Its folder is made
+    // here and nowhere else, so a run that redirects the ZIP leaves no empty dump_file behind.
     let zip_path = match &zip_override {
-        Some(folder) => cli::destination(folder, &session),
-        None => zip_dir.join(format!("{session}.zip")),
+        Some(destination) => cli::destination(destination, &session),
+        None => std::env::current_exe()?
+            .with_file_name("dump_file")
+            .join(format!("{session}.zip")),
     };
-    if let Some(parent) = zip_path.parent() {
+    // `--zip name.zip` names a file in the working directory, which has no parent to create.
+    if let Some(parent) = zip_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
 
@@ -136,10 +141,4 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
         transfer::offer(&zip);
     }
     Ok(())
-}
-
-pub(crate) fn environment_path(variable: &str) -> io::Result<PathBuf> {
-    let value = std::env::var_os(variable)
-        .ok_or_else(|| io::Error::other("environment variable is not set"))?;
-    Ok(PathBuf::from(value))
 }

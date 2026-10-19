@@ -1,6 +1,11 @@
-use std::{ffi::OsStr, fs, io, path::Path};
+use std::{
+    ffi::OsStr,
+    fs,
+    fs::{DirEntry, FileType},
+    io,
+    path::Path,
+};
 
-use crate::environment_path;
 use crate::error_log::ErrorLog;
 use crate::i18n::t;
 use crate::{command, logs, processes, status};
@@ -10,34 +15,28 @@ const APPLICATION_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@Syst
 const SYSTEM_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and Provider[@Name='Service Control Manager'] and (EventID=7000 or EventID=7001 or EventID=7009 or EventID=7011 or EventID=7022 or EventID=7023 or EventID=7024 or EventID=7031 or EventID=7034)]]";
 
 pub(crate) fn collect(work_dir: &Path, log: &ErrorLog) {
-    let _ = status::run(t("status.logs"), || {
-        logs::collect(work_dir, log);
-        Ok(())
-    });
-    let _ = status::run(t("status.events"), || {
+    status::step(t("status.logs"), || logs::collect(work_dir, log));
+    status::step(t("status.events"), || {
         for (channel, query) in [("Application", APPLICATION_QUERY), ("System", SYSTEM_QUERY)] {
             let _ = log.report("EVENTS", channel, collect_events(channel, query, work_dir));
         }
-        Ok(())
     });
-    let _ = status::run(t("status.wer"), || {
+    status::step(t("status.wer"), || {
         for (variable, label) in [("LOCALAPPDATA", "user"), ("ProgramData", "machine")] {
-            let Some(base) = log.report("WER", variable, environment_path(variable)) else {
+            let Some(base) = log.environment_path("WER", variable) else {
                 continue;
             };
             for queue in ["ReportArchive", "ReportQueue"] {
                 let source = base.join("Microsoft/Windows/WER").join(queue);
                 let destination = work_dir.join("crash/wer").join(label).join(queue);
-                let _ = log.report(
-                    "WER",
-                    source.display(),
-                    copy_reports(&source, &destination, log),
-                );
+                let copied = copy_matching("WER", &source, &destination, log, |entry, kind| {
+                    is_target_report(entry, kind, log)
+                });
+                let _ = log.report("WER", source.display(), copied);
             }
         }
-        Ok(())
     });
-    let _ = status::run(t("status.crashdumps"), || {
+    status::step(t("status.crashdumps"), || {
         for (variable, suffix, label) in [
             ("LOCALAPPDATA", "CrashDumps", "user"),
             (
@@ -56,18 +55,16 @@ pub(crate) fn collect(work_dir: &Path, log: &ErrorLog) {
                 "network-service",
             ),
         ] {
-            let Some(base) = log.report("CRASHDUMPS", variable, environment_path(variable)) else {
+            let Some(base) = log.environment_path("CRASHDUMPS", variable) else {
                 continue;
             };
             let source = base.join(suffix);
             let destination = work_dir.join("crash/dumps").join(label);
-            let _ = log.report(
-                "CRASHDUMPS",
-                source.display(),
-                copy_dumps(&source, &destination, log),
-            );
+            let copied = copy_matching("CRASHDUMPS", &source, &destination, log, |entry, kind| {
+                processes::is_dump_name(&entry.file_name()) && kind.is_file()
+            });
+            let _ = log.report("CRASHDUMPS", source.display(), copied);
         }
-        Ok(())
     });
 }
 
@@ -153,69 +150,54 @@ fn report_is_target(report: &str) -> bool {
         })
 }
 
-fn copy_reports(source: &Path, destination: &Path, log: &ErrorLog) -> io::Result<()> {
+/// Copies every entry of `source` the predicate accepts. Both crash-artifact walks differ only
+/// in what they accept, so the walk, the per-entry logging and the destination naming live here
+/// once instead of twice.
+fn copy_matching(
+    module: &str,
+    source: &Path,
+    destination: &Path,
+    log: &ErrorLog,
+    accept: impl Fn(&DirEntry, FileType) -> bool,
+) -> io::Result<()> {
     if !source.try_exists()? {
         return Ok(());
     }
     for entry in fs::read_dir(source)? {
-        let Some(entry) = log.report("WER", source.display(), entry) else {
+        let Some(entry) = log.report(module, source.display(), entry) else {
             continue;
         };
-        // Folder names are only a prefilter; Report.wer must identify a target executable.
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .contains("lertaro")
-        {
-            continue;
-        }
         let path = entry.path();
-        let Some(kind) = log.report("WER", path.display(), entry.file_type()) else {
+        let Some(kind) = log.report(module, path.display(), entry.file_type()) else {
             continue;
         };
-        if !kind.is_dir() {
+        if !accept(&entry, kind) {
             continue;
         }
-        let report_path = path.join("Report.wer");
-        let Some(bytes) = log.report("WER", report_path.display(), fs::read(&report_path)) else {
-            continue;
-        };
-        if report_is_target(&command::decode(&bytes, 0)) {
-            let _ = log.report(
-                "WER",
-                path.display(),
-                logs::copy_path(&path, &destination.join(entry.file_name()), log),
-            );
-        }
+        let _ = log.report(
+            module,
+            path.display(),
+            logs::copy_path(&path, &destination.join(entry.file_name()), log),
+        );
     }
     Ok(())
 }
 
-fn copy_dumps(source: &Path, destination: &Path, log: &ErrorLog) -> io::Result<()> {
-    if !source.try_exists()? {
-        return Ok(());
+/// A WER folder name is only a prefilter; the report inside must name a target executable.
+fn is_target_report(entry: &DirEntry, kind: FileType, log: &ErrorLog) -> bool {
+    let named = entry
+        .file_name()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("lertaro");
+    if !named || !kind.is_dir() {
+        return false;
     }
-    for entry in fs::read_dir(source)? {
-        let Some(entry) = log.report("CRASHDUMPS", source.display(), entry) else {
-            continue;
-        };
-        if !processes::is_dump_name(&entry.file_name()) {
-            continue;
-        }
-        let path = entry.path();
-        let Some(kind) = log.report("CRASHDUMPS", path.display(), entry.file_type()) else {
-            continue;
-        };
-        if kind.is_file() {
-            let _ = log.report(
-                "CRASHDUMPS",
-                path.display(),
-                logs::copy_path(&path, &destination.join(entry.file_name()), log),
-            );
-        }
+    let path = entry.path().join("Report.wer");
+    match log.report("WER", path.display(), fs::read(&path)) {
+        Some(bytes) => report_is_target(&command::decode(&bytes, 0)),
+        None => false,
     }
-    Ok(())
 }
 
 #[cfg(test)]

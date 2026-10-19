@@ -2,7 +2,7 @@ use std::{ffi::OsStr, fmt, io};
 
 use crate::command;
 
-pub(crate) const TARGET_NAMES: [&str; 2] = ["lertaro.app.exe", "lertaro.service.exe"];
+const TARGET_NAMES: [&str; 2] = ["lertaro.app.exe", "lertaro.service.exe"];
 
 pub(crate) struct Process {
     pub name: &'static str,
@@ -37,7 +37,7 @@ pub(crate) fn is_dump_name(name: &OsStr) -> bool {
             .any(|target| name.starts_with(&format!("{target}.")))
 }
 
-pub(crate) fn parse(output: &str) -> Vec<Process> {
+fn parse(output: &str) -> Vec<Process> {
     output
         .lines()
         .filter_map(|line| {

@@ -30,16 +30,19 @@ pub(crate) fn tr(key: Key, args: &[(&str, &dyn Display)]) -> String {
 /// Text for `key` in the detected language, falling back to English and then to the key.
 pub(crate) fn t(key: Key) -> &'static str {
     let catalogs = catalogs();
-    let code = language();
-    catalogs
-        .get(code)
-        .and_then(|table| table.get(key))
-        .or_else(|| catalogs.get(EN).and_then(|table| table.get(key)))
-        .copied()
-        .unwrap_or(key)
+    // A key no catalog defines is a typo at the call site rather than a message, so the debug
+    // build fails loudly instead of showing `prompt.ready.titel` in a dialog.
+    debug_assert!(
+        catalogs.values().any(|table| table.contains_key(key)),
+        "{key} is in no catalog"
+    );
+    let found = |code: &str| catalogs.get(code).and_then(|table| table.get(key));
+    // A half-translated catalog still answers in English rather than in raw keys.
+    let text = found(language()).or_else(|| found(EN));
+    text.copied().unwrap_or(key)
 }
 
-pub(crate) fn language() -> &'static str {
+fn language() -> &'static str {
     LANGUAGE.get_or_init(select)
 }
 
@@ -51,13 +54,22 @@ fn table(entries: &[(Key, &'static str)]) -> Table {
     entries.iter().copied().collect()
 }
 
-/// The first preference we ship a catalog for. English is the last resort for every
-/// language without a catalog, including Traditional Chinese.
 fn select() -> &'static str {
-    detect::preferred()
+    resolve(&detect::preferred(), detect::installed_ui_language())
+}
+
+/// The first preference with a catalog, English otherwise.
+///
+/// The installed UI language only speaks up when the preference list itself is missing: a
+/// reader who picked a language this program cannot show should get English, not the language
+/// their operating system happened to be installed with.
+fn resolve(preferred: &[String], installed: u16) -> &'static str {
+    if preferred.is_empty() {
+        return code_of_langid(installed).unwrap_or(EN);
+    }
+    preferred
         .iter()
         .find_map(|tag| code_of_tag(tag))
-        .or_else(|| code_of_langid(detect::installed_ui_language()))
         .unwrap_or(EN)
 }
 
@@ -382,9 +394,13 @@ mod tests {
         }
     }
 
+    /// A key in no catalog is a typo at the call site. The debug build panics on it so the
+    /// mistake cannot reach the screen as raw text, and the release build still degrades to
+    /// showing the key.
     #[test]
-    fn a_missing_key_is_shown_as_itself() {
-        assert_eq!(t("not.a.key"), "not.a.key");
+    #[should_panic(expected = "is in no catalog")]
+    fn an_unknown_key_is_a_programmer_error() {
+        t("prompt.ready.titel");
     }
 
     #[test]
@@ -414,9 +430,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_language_falls_back_to_english() {
-        assert_eq!(code_of_langid(0x04FF).unwrap_or(EN), EN);
-        assert_eq!(code_of_tag("de-DE").unwrap_or(EN), EN);
+    fn the_installed_language_only_answers_for_a_missing_list() {
+        let list = |tags: &[&str]| tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
+
+        // zh-CN installed, but the reader picked Japanese: English, not Chinese.
+        assert_eq!(resolve(&list(&["ja-JP"]), 0x0804), EN);
+        assert_eq!(resolve(&list(&["zh-TW", "en-US"]), 0x0804), EN);
+        assert_eq!(resolve(&list(&["ja-JP", "zh-CN"]), 0x0409), ZH);
+        assert_eq!(resolve(&list(&["zh-CN"]), 0x0409), ZH);
+
+        // No list at all: the installed UI language is the only evidence left.
+        assert_eq!(resolve(&[], 0x0804), ZH);
+        assert_eq!(resolve(&[], 0x0409), EN);
+        assert_eq!(resolve(&[], 0x0411), EN);
     }
 
     #[test]

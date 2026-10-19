@@ -47,6 +47,15 @@ impl ErrorLog {
             );
         }
     }
+
+    /// The folder an environment variable names. An unset variable is a finding to record,
+    /// not a reason to stop collecting, so it comes back as `None`.
+    pub(crate) fn environment_path(&self, module: &str, variable: &str) -> Option<PathBuf> {
+        let path = std::env::var_os(variable)
+            .ok_or_else(|| io::Error::other("environment variable is not set"))
+            .map(PathBuf::from);
+        self.report(module, variable, path)
+    }
 }
 
 pub(crate) fn format_record(module: &str, context: impl Display) -> String {
