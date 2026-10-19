@@ -72,9 +72,7 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     // here and nowhere else, so a run that redirects the ZIP leaves no empty dump_file behind.
     let zip_path = match &zip_override {
         Some(destination) => cli::destination(destination, &session),
-        None => std::env::current_exe()?
-            .with_file_name("dump_file")
-            .join(format!("{session}.zip")),
+        None => std::env::current_dir()?.join(format!("{session}.zip")),
     };
     // `--zip name.zip` names a file in the working directory, which has no parent to create.
     if let Some(parent) = zip_path
