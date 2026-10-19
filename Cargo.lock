@@ -5,3 +5,12 @@ version = 4
 [[package]]
 name = "get_dump_full"
 version = "0.1.1"
+dependencies = [
+ "win_msgbox_timeout",
+]
+
+[[package]]
+name = "win_msgbox_timeout"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3031854e4e702576fad36bef99462f2e474bf022b663a4a28fe3fd8e6bcfac73"
