@@ -4,7 +4,6 @@ mod command;
 mod diagnostics;
 mod dump;
 mod error_log;
-mod freeze;
 mod i18n;
 mod logs;
 mod processes;
@@ -85,17 +84,6 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     // The reproduction has to survive reading the dialogs, so the processes are frozen before
     // anything is asked or collected and released as soon as the dumps have landed.
     let processes = status::run(t("status.processes"), processes::running);
-    let mut frozen = log.report(
-        "FREEZE",
-        "suspend",
-        status::run(t("status.freeze"), || {
-            freeze::suspend(processes.as_deref().unwrap_or_default(), &log)
-        }),
-    );
-    if let Some(frozen) = &frozen {
-        frozen.announce();
-    }
-    let memory = matches!(&processes, Ok(list) if !list.is_empty()) && prompt::memory();
 
     // Machine, permission and runtime details belong in every bundle, dump or no dump.
     system::collect(&work_dir, &log);
@@ -103,6 +91,7 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     // the app is still running, so they are collected before the dump decision.
     diagnostics::collect(&work_dir, &log);
 
+    let memory = matches!(&processes, Ok(list) if !list.is_empty()) && prompt::memory();
     // An unsuccessful query is not evidence that all target processes have stopped.
     let mut uncompressed = false;
     if let Some(processes) = log.report("PROCESSES", "query", processes)
@@ -119,19 +108,9 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
             )
             .unwrap_or_default();
     }
-    // Frozen processes keep their locks, so Lertaro runs again while 7-Zip works.
-    if let Some(frozen) = &mut frozen
-        && frozen.has_processes()
-    {
-        let _ = log.report(
-            "FREEZE",
-            "resume",
-            status::run(t("status.resume"), || frozen.resume()),
-        );
-    }
     // A full dump is raw memory, so deflating earns its keep. Mini dumps are already small,
     // where compressing only costs time.
-    let level = if uncompressed { "-mx=1" } else { "-mx=0" };
+    let level = if uncompressed { "-mx=5" } else { "-mx=0" };
     let archived = status::run(t("status.archive"), || {
         archive::create(&work_dir, &zip_path, level)
     });
