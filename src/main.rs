@@ -39,7 +39,7 @@ fn run(arguments: &[OsString]) -> io::Result<()> {
     }
 }
 
-/// Freezes the target processes, collects everything that describes the failure, and packs it.
+/// Collects everything that describes the failure and packs it.
 fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     // Nothing is read or written until the reproduction is confirmed on screen.
     if !prompt::ready() {
@@ -67,8 +67,8 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
     fs::create_dir_all(&work_dir)?;
     let log = ErrorLog::new(&work_dir)?;
 
-    // The bundle belongs next to the program unless --zip said otherwise. Its folder is made
-    // here and nowhere else, so a run that redirects the ZIP leaves no empty dump_file behind.
+    // The bundle lands in the working directory unless --zip said otherwise, so a double-clicked
+    // run writes it beside the program.
     let zip_path = match &zip_override {
         Some(destination) => cli::destination(destination, &session),
         None => std::env::current_dir()?.join(format!("{session}.zip")),
@@ -81,15 +81,18 @@ fn collect(zip_override: Option<PathBuf>) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    // The reproduction has to survive reading the dialogs, so the processes are frozen before
-    // anything is asked or collected and released as soon as the dumps have landed.
+    // The running copies decide which log folders hold the failure and whether a dump is even
+    // possible, so the list is read before anything is collected.
     let processes = status::run(t("status.processes"), processes::running);
+    // Where each running copy keeps its state is asked by the permission report and by the log
+    // collection, and answering it costs a query per process, so it is read once here.
+    let origins = processes::origins(processes.as_deref().unwrap_or_default(), &log);
 
     // Machine, permission and runtime details belong in every bundle, dump or no dump.
-    system::collect(&work_dir, &log);
+    system::collect(&work_dir, &log, &origins);
     // Logs and previously written crash artifacts describe the failure just as well while
     // the app is still running, so they are collected before the dump decision.
-    diagnostics::collect(&work_dir, &log);
+    diagnostics::collect(&work_dir, &log, &origins);
 
     let memory = matches!(&processes, Ok(list) if !list.is_empty()) && prompt::memory();
     // An unsuccessful query is not evidence that all target processes have stopped.

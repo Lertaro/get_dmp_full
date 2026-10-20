@@ -5,7 +5,7 @@ use std::{
 
 use crate::error_log::ErrorLog;
 use crate::i18n::t;
-use crate::{command, status, tools};
+use crate::{command, processes, status, tools};
 
 const PRODUCT: &str = "lertaro";
 const SERVICE_NAME: &str = "LertaroService";
@@ -59,7 +59,7 @@ const DOTNET_COMPONENTS: [&str; 3] = [
 ];
 const DOTNET_MAJORS: [u32; 4] = [7, 8, 9, 10];
 
-pub(crate) fn collect(work_dir: &Path, log: &ErrorLog) {
+pub(crate) fn collect(work_dir: &Path, log: &ErrorLog, origins: &[Option<PathBuf>]) {
     let _ = log.report(
         "SYSTEM",
         "fastfetch.txt",
@@ -68,7 +68,9 @@ pub(crate) fn collect(work_dir: &Path, log: &ErrorLog) {
     let _ = log.report(
         "SYSTEM",
         "icacls.txt",
-        status::run(t("status.permissions"), || permissions(work_dir, log)),
+        status::run(t("status.permissions"), || {
+            permissions(work_dir, log, origins)
+        }),
     );
     let _ = log.report(
         "SYSTEM",
@@ -95,9 +97,12 @@ fn fastfetch(work_dir: &Path) -> io::Result<()> {
     write_report(work_dir, "fastfetch.txt", &text)
 }
 
-fn permissions(work_dir: &Path, log: &ErrorLog) -> io::Result<()> {
+fn permissions(work_dir: &Path, log: &ErrorLog, origins: &[Option<PathBuf>]) -> io::Result<()> {
     let mut targets: Vec<(&'static str, PathBuf)> = Vec::new();
     for (label, path) in install_dirs(log) {
+        push(&mut targets, label, path);
+    }
+    for (label, path) in running_targets(origins, log) {
         push(&mut targets, label, path);
     }
     for (label, variable) in [
@@ -347,6 +352,20 @@ fn release_at_least(release: u32, label: &str) -> bool {
         .is_some_and(|(_, minimum)| release >= *minimum)
 }
 
+/// The folders of the copies that are actually running. Neither of them is in `install_dirs` or in
+/// the AppData pair when a portable copy is unpacked somewhere else: its program folder is not
+/// registered, and its state is not in AppData, so a permission problem there would go unreported.
+fn running_targets(origins: &[Option<PathBuf>], log: &ErrorLog) -> Vec<(&'static str, PathBuf)> {
+    let mut targets: Vec<(&'static str, PathBuf)> = Vec::new();
+    for origin in origins.iter().flatten() {
+        push(&mut targets, "install-running", origin.clone());
+        if let Some(data) = processes::portable_data(origin, log) {
+            push(&mut targets, "config-portable", data);
+        }
+    }
+    targets
+}
+
 fn install_dirs(log: &ErrorLog) -> Vec<(&'static str, PathBuf)> {
     let mut dirs: Vec<(&'static str, PathBuf)> = Vec::new();
     for root in UNINSTALL_ROOTS {
@@ -494,5 +513,72 @@ mod tests {
     fn registry_release_values_are_hex_with_their_prefix() {
         assert_eq!(parse_release("0x80231"), Some(524_849));
         assert_eq!(parse_release("533320"), None);
+    }
+
+    /// A portable copy's folder is neither in the uninstall registry nor in the AppData pair, so
+    /// the report has to name it and its `Data` from the running copy itself.
+    #[test]
+    fn a_running_copy_adds_its_own_folder_and_its_data() {
+        let portable = std::env::temp_dir().join("get_dump_full-perms-portable");
+        let installed = std::env::temp_dir().join("get_dump_full-perms-installed");
+        for directory in [&portable, &installed] {
+            let _ = fs::remove_dir_all(directory);
+        }
+        fs::create_dir_all(portable.join("Data")).unwrap();
+        fs::create_dir_all(&installed).unwrap();
+        let log = ErrorLog::new(&installed).unwrap();
+
+        let targets = running_targets(
+            &[
+                Some(portable.clone()),
+                Some(portable.clone()),
+                Some(installed.clone()),
+                None,
+            ],
+            &log,
+        );
+        let labels: Vec<&str> = targets.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            ["install-running", "config-portable", "install-running"]
+        );
+        assert_eq!(targets[1].1, portable.join("Data"));
+        assert_eq!(targets[2].1, installed);
+    }
+
+    /// The same chain the run uses: the folders of a running copy reach `icacls.exe`, and its
+    /// output for them lands in the report under their labels. The fixture stands in for a copy
+    /// nobody asked to start, and the assertions stay free of report wording because `icacls`
+    /// answers in the console language.
+    #[test]
+    fn a_running_copy_is_inspected_by_icacls_in_the_report() {
+        let copy = std::env::temp_dir().join("get_dump_full-perms-report");
+        let _ = fs::remove_dir_all(&copy);
+        fs::create_dir_all(copy.join("Data")).unwrap();
+        let work = copy.join("bundle");
+        fs::create_dir_all(&work).unwrap();
+        let log = ErrorLog::new(&work).unwrap();
+
+        permissions(&work, &log, &[Some(copy.clone())]).unwrap();
+        let text = fs::read_to_string(work.join("system/icacls.txt")).unwrap();
+        let _ = fs::remove_dir_all(&copy);
+
+        for (label, path) in [
+            ("install-running", copy.clone()),
+            ("config-portable", copy.join("Data")),
+        ] {
+            let header = format!("[{label}] {}\r\n", path.display());
+            let section = text
+                .split_once(&header)
+                .unwrap_or_else(|| panic!("{label} is missing from the report:\n{text}"))
+                .1
+                .split("\r\n\r\n")
+                .next()
+                .unwrap_or_default();
+            assert!(
+                section.contains(":("),
+                "{label} has no access entry, so icacls did not read it:\n{section}"
+            );
+        }
     }
 }

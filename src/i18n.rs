@@ -192,7 +192,7 @@ const ZH_ENTRIES: &[(Key, &str)] = &[
     ),
     (
         "help.location",
-        "不带 --zip 时，诊断包写在程序目录的 dump_file\\ 下。",
+        "不带 --zip 时，诊断包以 <时间戳>-<进程号>.zip 写在当前工作目录；双击运行时，这个目录就是程序所在目录。",
     ),
     ("help.repository", "源码与使用说明：{url}"),
     ("status.line", "{label}（{elapsed}）"),
@@ -267,7 +267,8 @@ const EN_ENTRIES: &[(Key, &str)] = &[
     ),
     (
         "help.location",
-        "Without --zip the bundle is written to dump_file\\ next to the program.",
+        "Without --zip the bundle is written to <timestamp>-<pid>.zip in the working directory, \
+         which for a double-clicked run is the program folder.",
     ),
     ("help.repository", "Source and documentation: {url}"),
     ("status.line", "{label} ({elapsed})"),

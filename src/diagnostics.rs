@@ -3,7 +3,7 @@ use std::{
     fs,
     fs::{DirEntry, FileType},
     io,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::error_log::ErrorLog;
@@ -14,8 +14,8 @@ use crate::{command, logs, processes, status};
 const APPLICATION_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and ((Provider[@Name='Application Error'] and EventID=1000) or (Provider[@Name='.NET Runtime'] and EventID=1026) or (Provider[@Name='Windows Error Reporting'] and EventID=1001))]]";
 const SYSTEM_QUERY: &str = "*[System[Level=2 and TimeCreated[timediff(@SystemTime)>=0 and timediff(@SystemTime)<=86400000] and Provider[@Name='Service Control Manager'] and (EventID=7000 or EventID=7001 or EventID=7009 or EventID=7011 or EventID=7022 or EventID=7023 or EventID=7024 or EventID=7031 or EventID=7034)]]";
 
-pub(crate) fn collect(work_dir: &Path, log: &ErrorLog) {
-    status::step(t("status.logs"), || logs::collect(work_dir, log));
+pub(crate) fn collect(work_dir: &Path, log: &ErrorLog, origins: &[Option<PathBuf>]) {
+    status::step(t("status.logs"), || logs::collect(work_dir, log, origins));
     status::step(t("status.events"), || {
         for (channel, query) in [("Application", APPLICATION_QUERY), ("System", SYSTEM_QUERY)] {
             let _ = log.report("EVENTS", channel, collect_events(channel, query, work_dir));
