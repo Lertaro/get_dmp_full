@@ -188,7 +188,9 @@ const ZH_ENTRIES: &[(Key, &str)] = &[
     (
         "help.usage",
         "用法：\n  get_dump_full.exe                直接运行，按提示完成采集与打包\n  \
-         get_dump_full.exe --zip <路径>   指定诊断包落点：以 .zip 结尾按该名字写，否则当作目录",
+         get_dump_full.exe --zip <路径>   指定诊断包落点：以 .zip 结尾按该名字写，否则当作目录\n  \
+         get_dump_full.exe --no-dump      不抓内存转储：结果不对、界面异常这类问题用这个\n  \
+         get_dump_full.exe --ranking      排序问题专用：不查崩溃证据也不抓转储，弹窗里的那一问省了",
     ),
     (
         "help.location",
@@ -203,6 +205,7 @@ const ZH_ENTRIES: &[(Key, &str)] = &[
     ("status.account", "正在检查账户权限"),
     ("status.dotnet", "正在检查 .NET 环境"),
     ("status.logs", "正在复制应用日志"),
+    ("status.manifest", "正在生成诊断清单"),
     ("status.events", "正在查询事件日志"),
     ("status.wer", "正在收集崩溃报告"),
     ("status.crashdumps", "正在收集崩溃转储"),
@@ -217,10 +220,18 @@ const ZH_ENTRIES: &[(Key, &str)] = &[
          如果是搜索相关的 bug，请将复现问题的 Lertaro 窗口置顶（鼠标中键点击搜索框的 Lertaro 图标）。\n\
          点“确定”开始抓取，点“取消”结束本次运行。",
     ),
+    ("prompt.ranking.title", "Lertaro 诊断 · 问题类型"),
+    (
+        "prompt.ranking.body",
+        "这次的问题是不是搜索结果排序不对（该靠前的排到了后面、类型顺序不对、结果少了一条）？\n\
+         选“是”只收排运用得上的东西：设置、排名校准记录、应用日志和系统信息，不查崩溃事件，\
+         也不抓内存转储，几秒钟就完。\n\
+         选“否”按崩溃流程继续，之后会再问一次转储类型。",
+    ),
     ("prompt.memory.title", "Lertaro 诊断 · 转储类型"),
     (
         "prompt.memory.body",
-        "本次问题是否与内存有关（排序条目有误、卡住、占用暴涨、图标资源故障）？\n\
+        "本次问题是否与内存有关（卡住、占用暴涨、图标资源故障）？\n\
          选“是”抓取包含堆内存的完整转储，包体积大约大一个数量级；选“否”只抓迷你转储。",
     ),
     ("prompt.full_dump.title", "Lertaro 诊断 · 即将抓取完整转储"),
@@ -263,7 +274,9 @@ const EN_ENTRIES: &[(Key, &str)] = &[
     (
         "help.usage",
         "Usage:\n  get_dump_full.exe                run it and follow the prompts\n  \
-         get_dump_full.exe --zip <path>   where the bundle goes: a name ending in .zip, or a folder",
+         get_dump_full.exe --zip <path>   where the bundle goes: a name ending in .zip, or a folder\n  \
+         get_dump_full.exe --no-dump      skip the memory dump: for wrong results or UI issues\n  \
+         get_dump_full.exe --ranking      a ranking report: no crash evidence, no dump, and no extra question",
     ),
     (
         "help.location",
@@ -279,6 +292,7 @@ const EN_ENTRIES: &[(Key, &str)] = &[
     ("status.account", "Checking account privileges"),
     ("status.dotnet", "Checking the .NET environment"),
     ("status.logs", "Copying application logs"),
+    ("status.manifest", "Writing the bundle manifest"),
     ("status.events", "Querying event logs"),
     ("status.wer", "Collecting crash reports"),
     ("status.crashdumps", "Collecting crash dumps"),
@@ -294,10 +308,20 @@ const EN_ENTRIES: &[(Key, &str)] = &[
          (middle-click the Lertaro icon in the search box).\n\
          Choose OK to start the capture, or Cancel to end this run.",
     ),
+    ("prompt.ranking.title", "Lertaro Diagnostics · Problem type"),
+    (
+        "prompt.ranking.body",
+        "Is this a wrong search result order - a row that belongs higher sits lower, the type order \
+         is wrong, or a result is missing?\n\
+         Yes collects only what a ranking report uses: the settings, the ranking calibration log, the \
+         application logs and the system information. No crash evidence and no memory dump, done in \
+         seconds.\n\
+         No continues as a failure report and asks about the dump type next.",
+    ),
     ("prompt.memory.title", "Lertaro Diagnostics · Dump type"),
     (
         "prompt.memory.body",
-        "Is this problem memory related (Sorting entries are wrong, Freezing, High resource usage, Icon failure)?\n\
+        "Is this problem memory related (Freezing, High resource usage, Icon failure)?\n\
          Yes captures a full dump including the heap, roughly an order of magnitude larger; \
          No captures a mini dump.",
     ),

@@ -8,15 +8,23 @@ use crate::i18n::{t, tr};
 
 pub(crate) const REPOSITORY: &str = "https://github.com/Lertaro/get_dmp_full";
 
-/// What the command line asked for. Any argument other than a complete `--zip <path>` is
-/// treated as a request for help, so a mistyped option never starts a capture.
+/// What the command line asked for. Any argument other than the complete options below is treated as a
+/// request for help, so a mistyped option never starts a capture.
 pub(crate) enum Invocation {
     Help,
-    Collect { zip: Option<PathBuf> },
+    Collect {
+        zip: Option<PathBuf>,
+        no_dump: bool,
+        /// The ranking questions were already answered, so the run neither asks them nor collects
+        /// the crash evidence around a dump.
+        ranking: bool,
+    },
 }
 
 pub(crate) fn resolve(arguments: &[OsString]) -> io::Result<Invocation> {
     let mut zip = None;
+    let mut no_dump = false;
+    let mut ranking = false;
     let mut other = false;
     let mut iterator = arguments.iter();
     while let Some(argument) = iterator.next() {
@@ -25,6 +33,13 @@ pub(crate) fn resolve(arguments: &[OsString]) -> io::Result<Invocation> {
                 .next()
                 .ok_or_else(|| io::Error::other("missing path after --zip"))?;
             zip = Some(PathBuf::from(path));
+        } else if argument == "--no-dump" {
+            no_dump = true;
+        } else if argument == "--ranking" {
+            // A ranking bundle holds no dump by definition, so this turns the dump off rather than
+            // leaving a second switch for the caller to keep in step.
+            ranking = true;
+            no_dump = true;
         } else {
             other = true;
         }
@@ -32,7 +47,11 @@ pub(crate) fn resolve(arguments: &[OsString]) -> io::Result<Invocation> {
     Ok(if other {
         Invocation::Help
     } else {
-        Invocation::Collect { zip }
+        Invocation::Collect {
+            zip,
+            no_dump,
+            ranking,
+        }
     })
 }
 
@@ -70,14 +89,44 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_or_zip_command_line_collects() {
+    fn only_the_known_options_collect() {
         assert!(matches!(
             resolve(&arguments(&[])).unwrap(),
-            Invocation::Collect { zip: None }
+            Invocation::Collect {
+                zip: None,
+                no_dump: false,
+                ranking: false
+            }
         ));
         assert!(matches!(
             resolve(&arguments(&["--zip", "D:\\out"])).unwrap(),
-            Invocation::Collect { zip: Some(_) }
+            Invocation::Collect {
+                zip: Some(_),
+                no_dump: false,
+                ranking: false
+            }
+        ));
+        assert!(matches!(
+            resolve(&arguments(&["--no-dump", "--zip", "D:\\out.zip"])).unwrap(),
+            Invocation::Collect {
+                zip: Some(_),
+                no_dump: true,
+                ranking: false
+            }
+        ));
+    }
+
+    /// The ranking option is asked to imply the dump is off, so a caller cannot ask for a ranking
+    /// bundle that then stalls the machine for minutes.
+    #[test]
+    fn ranking_turns_the_dump_off_with_it() {
+        assert!(matches!(
+            resolve(&arguments(&["--ranking"])).unwrap(),
+            Invocation::Collect {
+                zip: None,
+                no_dump: true,
+                ranking: true
+            }
         ));
     }
 

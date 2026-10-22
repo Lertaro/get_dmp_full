@@ -40,6 +40,18 @@ pub(crate) fn ready() -> bool {
     )
 }
 
+/// Asks which kind of problem this is, because the two answers collect almost nothing in common: a
+/// wrong order is answered by the ranking log and the settings, and a crash by the dump and the crash
+/// artifacts. Asked second, after the reproduction is confirmed, so a person who cancelled never sees
+/// it.
+pub(crate) fn ranking() -> bool {
+    ask(
+        Buttons::YesNo,
+        t("prompt.ranking.body"),
+        t("prompt.ranking.title"),
+    )
+}
+
 /// Decides the dump type, so it is only asked while a target process is running.
 pub(crate) fn memory() -> bool {
     ask(
