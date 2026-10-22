@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "get_dump_full"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "win_msgbox_timeout",
 ]
